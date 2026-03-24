@@ -32,6 +32,7 @@ if REPO_ROOT not in sys.path:
 
 import h5py
 import numpy as np
+import torch
 from tqdm import tqdm
 
 from lewm.math_utils import forward_up_from_quat
@@ -61,6 +62,8 @@ DEFAULT_TEXTURE_COUNT = 27
 DEFAULT_TEXTURE_VARIANTS_PER_WORKER = 4
 VULKAN_SAFE_WORKER_LIMIT = 4
 VULKAN_SAFE_TEXTURE_VARIANT_LIMIT = 1
+HIP_SAFE_WORKER_LIMIT = 1
+HIP_SAFE_TEXTURE_VARIANT_LIMIT = 1
 
 # Camera pose jitter range (metres / radians)
 CAM_POS_JITTER = 0.008
@@ -412,6 +415,8 @@ def main():
     parser.add_argument("--sim_backend", type=str, default="auto")
     parser.add_argument("--texture_count", type=int, default=DEFAULT_TEXTURE_COUNT)
     parser.add_argument("--texture_variants_per_worker", type=int, default=DEFAULT_TEXTURE_VARIANTS_PER_WORKER)
+    parser.add_argument("--unsafe_backend_parallelism", action="store_true",
+                        help="Disable backend safety caps for parallel Genesis rendering.")
     parser.add_argument("--unsafe_vulkan_parallelism", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--img_res", type=int, default=DEFAULT_IMG_RES)
@@ -421,14 +426,27 @@ def main():
 
     effective_workers = max(1, int(args.workers))
     effective_texture_variants = max(1, int(args.texture_variants_per_worker))
+    backend_name = args.sim_backend.lower().strip()
+    unsafe_parallelism = args.unsafe_backend_parallelism or args.unsafe_vulkan_parallelism
 
-    if args.sim_backend.lower().strip() == "vulkan" and not args.unsafe_vulkan_parallelism:
+    if backend_name == "vulkan" and not unsafe_parallelism:
         capped_workers = min(effective_workers, VULKAN_SAFE_WORKER_LIMIT)
         capped_variants = min(effective_texture_variants, VULKAN_SAFE_TEXTURE_VARIANT_LIMIT)
         if (capped_workers, capped_variants) != (effective_workers, effective_texture_variants):
             tqdm.write(
                 f"Vulkan safety caps applied: workers {effective_workers}->{capped_workers}, "
                 f"texture_variants {effective_texture_variants}->{capped_variants}."
+            )
+        effective_workers = capped_workers
+        effective_texture_variants = capped_variants
+    elif getattr(torch.version, "hip", None) and backend_name in {"auto", "gpu", "amdgpu", "amd", "hip"} and not unsafe_parallelism:
+        capped_workers = min(effective_workers, HIP_SAFE_WORKER_LIMIT)
+        capped_variants = min(effective_texture_variants, HIP_SAFE_TEXTURE_VARIANT_LIMIT)
+        if (capped_workers, capped_variants) != (effective_workers, effective_texture_variants):
+            tqdm.write(
+                f"ROCm/AMDGPU safety caps applied: workers {effective_workers}->{capped_workers}, "
+                f"texture_variants {effective_texture_variants}->{capped_variants}. "
+                f"Use --unsafe_backend_parallelism to override."
             )
         effective_workers = capped_workers
         effective_texture_variants = capped_variants
@@ -558,6 +576,22 @@ def main():
 
             for p in processes:
                 p.join()
+
+            failed = [p.pid for p in processes if p.exitcode not in (0, None)]
+            missing_tmp = [tmp for tmp in tmp_files if not os.path.exists(tmp)]
+            if failed or missing_tmp:
+                for tmp in tmp_files:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    "Render worker failure before stitching. "
+                    f"backend={args.sim_backend}, workers={effective_workers}, img_res={args.img_res}, "
+                    f"failed_pids={failed}, missing_tmp_files={len(missing_tmp)}. "
+                    "On AMD/ROCm, rerun with --workers 1 or use --sim_backend vulkan/cpu."
+                )
 
             pbar.set_description(f"{chunk_label}  stitching...")
             stitch_hdf5(out_path, tmp_files, tasks, data, N, T, args.img_res)
