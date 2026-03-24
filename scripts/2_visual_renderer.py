@@ -256,7 +256,7 @@ def render_worker(args_tuple):
     (worker_id, chunk_file, start_env, end_env,
      tmp_file, sim_backend, texture_dir, obstacle_json, beacon_json,
      texture_count, texture_variants, beacon_confuse_prob, img_res,
-     tmp_vision_compression, progress_queue) = args_tuple
+     tmp_vision_compression, skip_physics_step, progress_queue) = args_tuple
 
     N_subset = end_env - start_env
 
@@ -357,7 +357,8 @@ def render_worker(args_tuple):
                 robot.set_quat(base_quat)
                 robot.set_dofs_position(joint_pos_seq[step].unsqueeze(0), act_dofs)
 
-                scene.step(update_visualizer=False)
+                if not skip_physics_step:
+                    scene.step(update_visualizer=False)
 
                 # ---- Camera placement with jitter ---- #
                 q_np = to_numpy(base_quat_seq[step])
@@ -377,7 +378,7 @@ def render_worker(args_tuple):
                     up=up,
                 )
 
-                render_out = cam.render(rgb=True)
+                render_out = cam.render(rgb=True, force_render=skip_physics_step)
                 rgb = render_out[0]
                 if hasattr(rgb, "cpu"):
                     rgb = rgb.cpu().numpy()
@@ -505,6 +506,11 @@ def main():
         type=str,
         default="gzip",
         help="Compression for final stitched vision datasets: none | gzip | lzf",
+    )
+    parser.add_argument(
+        "--skip_physics_step",
+        action="store_true",
+        help="Replay recorded poses without advancing Genesis physics; force camera refresh on render.",
     )
     args = parser.parse_args()
 
@@ -642,6 +648,7 @@ def main():
                     args.sim_backend, texture_dir, obstacle_json, beacon_json,
                     args.texture_count, effective_texture_variants,
                     args.beacon_confuse_prob, args.img_res, tmp_vision_compression,
+                    args.skip_physics_step,
                 ))
 
             progress_queue = mp.Queue()
