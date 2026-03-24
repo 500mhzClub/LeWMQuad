@@ -300,8 +300,13 @@ def render_worker(args_tuple):
         print(f"[worker {worker_id}] DRM render nodes: {', '.join(render_nodes)}", flush=True)
     env_bundle_ids = worker_rng.randint(0, len(bundles), size=N_subset)
 
-    data = np.load(chunk_file, allow_pickle=True)
-    T = data["base_pos"].shape[1]
+    with np.load(chunk_file, allow_pickle=True) as data_npz:
+        # `.npz` archives are lazy zip members; repeated `data_npz["key"]`
+        # lookups re-read and decompress. Materialize the hot arrays once.
+        base_pos_all = np.asarray(data_npz["base_pos"])
+        base_quat_all = np.asarray(data_npz["base_quat"])
+        joint_pos_all = np.asarray(data_npz["joint_pos"])
+    T = base_pos_all.shape[1]
 
     with h5py.File(tmp_file, "w") as f:
         h5_vision = f.create_dataset(
@@ -317,13 +322,13 @@ def render_worker(args_tuple):
             env_rng = np.random.RandomState(worker_seed + env_idx * 7919 + 17)
 
             base_pos_seq = torch.tensor(
-                data["base_pos"][env_idx], device=gs.device, dtype=torch.float32,
+                base_pos_all[env_idx], device=gs.device, dtype=torch.float32,
             )
             base_quat_seq = torch.tensor(
-                data["base_quat"][env_idx], device=gs.device, dtype=torch.float32,
+                base_quat_all[env_idx], device=gs.device, dtype=torch.float32,
             )
             joint_pos_seq = torch.tensor(
-                data["joint_pos"][env_idx], device=gs.device, dtype=torch.float32,
+                joint_pos_all[env_idx], device=gs.device, dtype=torch.float32,
             )
 
             env_video = np.zeros((T, 3, img_res, img_res), dtype=np.uint8)
