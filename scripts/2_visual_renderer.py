@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visual renderer: renders egocentric 64x64 RGB from recorded physics rollouts.
+"""Visual renderer: renders egocentric RGB from recorded physics rollouts.
 
 Extended from TinyQuadJEPA-v2 with:
   - Beacon panel rendering (coloured panels added to the scene)
@@ -52,7 +52,7 @@ JOINTS_ACTUATED = [
     "lf_calf_joint", "lh_calf_joint", "rf_calf_joint", "rh_calf_joint",
 ]
 
-IMG_RES = 64
+DEFAULT_IMG_RES = 224
 CAM_FOV = 58
 CAM_FORWARD_OFFSET = 0.10
 CAM_UP_OFFSET = 0.05
@@ -133,6 +133,7 @@ def build_render_bundle(
     layout: ObstacleLayout,
     beacon_layout: BeaconLayout,
     rng: np.random.RandomState,
+    img_res: int,
     beacon_confuse_prob: float = 0.3,
 ):
     """Construct one textured render scene variant with beacon panels."""
@@ -172,7 +173,7 @@ def build_render_bundle(
     robot = scene.add_entity(
         gs.morphs.URDF(file=URDF_PATH, fixed=False, merge_fixed_links=False),
     )
-    cam = scene.add_camera(res=(IMG_RES, IMG_RES), fov=CAM_FOV, GUI=False)
+    cam = scene.add_camera(res=(img_res, img_res), fov=CAM_FOV, GUI=False)
     scene.build(n_envs=1)
 
     name_to_joint = {j.name: j for j in robot.joints}
@@ -196,7 +197,7 @@ def render_worker(args_tuple):
     """Each worker renders a subset of environments from one .npz chunk."""
     (worker_id, chunk_file, start_env, end_env,
      tmp_file, sim_backend, texture_dir, obstacle_json, beacon_json,
-     texture_count, texture_variants, beacon_confuse_prob, progress_queue) = args_tuple
+     texture_count, texture_variants, beacon_confuse_prob, img_res, progress_queue) = args_tuple
 
     N_subset = end_env - start_env
 
@@ -239,6 +240,7 @@ def render_worker(args_tuple):
             layout,
             beacon_layout,
             np.random.RandomState(worker_seed + 1009 * (variant_offset + 1)),
+            img_res=img_res,
             beacon_confuse_prob=beacon_confuse_prob,
         )
         for variant_offset, texture_idx in enumerate(variant_ids)
@@ -250,7 +252,7 @@ def render_worker(args_tuple):
 
     with h5py.File(tmp_file, "w") as f:
         h5_vision = f.create_dataset(
-            "vision", (N_subset, T, 3, IMG_RES, IMG_RES), dtype="uint8", compression="gzip",
+            "vision", (N_subset, T, 3, img_res, img_res), dtype="uint8", compression="gzip",
         )
 
         for local_idx, env_idx in enumerate(range(start_env, end_env)):
@@ -271,7 +273,7 @@ def render_worker(args_tuple):
                 data["joint_pos"][env_idx], device=gs.device, dtype=torch.float32,
             )
 
-            env_video = np.zeros((T, 3, IMG_RES, IMG_RES), dtype=np.uint8)
+            env_video = np.zeros((T, 3, img_res, img_res), dtype=np.uint8)
 
             for step in range(T):
                 base_pos = base_pos_seq[step].unsqueeze(0)
@@ -336,15 +338,16 @@ def stitch_hdf5(
     data: dict,
     N: int,
     T: int,
+    img_res: int,
 ) -> None:
     """Merge per-worker HDF5 shards and raw data into one final HDF5 file."""
     tmp_out = out_path + ".stitching"
     try:
         with h5py.File(tmp_out, "w") as h5f:
             h5_vision = h5f.create_dataset(
-                "vision", (N, T, 3, IMG_RES, IMG_RES),
+                "vision", (N, T, 3, img_res, img_res),
                 dtype="uint8",
-                chunks=(1, T, 3, IMG_RES, IMG_RES),
+                chunks=(1, T, 3, img_res, img_res),
                 compression="gzip",
             )
 
@@ -401,7 +404,7 @@ def main():
     mp.set_start_method("spawn", force=True)
 
     parser = argparse.ArgumentParser(
-        description="Render egocentric 64x64 RGB from recorded physics rollouts.",
+        description="Render egocentric RGB from recorded physics rollouts.",
     )
     parser.add_argument("--raw_dir", type=str, default="jepa_raw_data")
     parser.add_argument("--out_dir", type=str, default="jepa_final_dataset")
@@ -411,6 +414,7 @@ def main():
     parser.add_argument("--texture_variants_per_worker", type=int, default=DEFAULT_TEXTURE_VARIANTS_PER_WORKER)
     parser.add_argument("--unsafe_vulkan_parallelism", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--img_res", type=int, default=DEFAULT_IMG_RES)
     parser.add_argument("--beacon_confuse_prob", type=float, default=0.3,
                         help="Probability that a wall gets a beacon-like colour.")
     args = parser.parse_args()
@@ -532,7 +536,7 @@ def main():
                     i, file_path, start, end, tmp,
                     args.sim_backend, texture_dir, obstacle_json, beacon_json,
                     args.texture_count, effective_texture_variants,
-                    args.beacon_confuse_prob,
+                    args.beacon_confuse_prob, args.img_res,
                 ))
 
             progress_queue = mp.Queue()
@@ -556,7 +560,7 @@ def main():
                 p.join()
 
             pbar.set_description(f"{chunk_label}  stitching...")
-            stitch_hdf5(out_path, tmp_files, tasks, data, N, T)
+            stitch_hdf5(out_path, tmp_files, tasks, data, N, T, args.img_res)
             tqdm.write(f"  {chunk_name} done  ({N} envs, {T} steps)  ->  {out_path}")
 
     tqdm.write("All chunks rendered.")

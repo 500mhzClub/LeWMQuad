@@ -45,8 +45,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_dir", type=str, default="jepa_final_dataset")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch_size", type=int, default=2048)
-    p.add_argument("--seq_len", type=int, default=16)
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--seq_len", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -57,13 +57,21 @@ def parse_args() -> argparse.Namespace:
     # LeWM-specific hypers
     p.add_argument("--sigreg_lambda", type=float, default=0.1,
                     help="Weight λ for SIGReg regularisation (only tunable hyper).")
-    p.add_argument("--sigreg_projections", type=int, default=512,
+    p.add_argument("--sigreg_projections", type=int, default=1024,
                     help="Number of random projections M in SIGReg.")
     p.add_argument("--sigreg_knots", type=int, default=17,
                     help="Number of quadrature knots for Epps-Pulley test.")
-    p.add_argument("--pred_layers", type=int, default=4)
-    p.add_argument("--pred_heads", type=int, default=8)
+    p.add_argument("--latent_dim", type=int, default=192)
+    p.add_argument("--pred_hidden_dim", type=int, default=384)
+    p.add_argument("--pred_layers", type=int, default=6)
+    p.add_argument("--pred_heads", type=int, default=16)
     p.add_argument("--pred_dropout", type=float, default=0.1)
+    p.add_argument("--image_size", type=int, default=None,
+                   help="Input image size. Defaults to the rendered dataset size.")
+    p.add_argument("--patch_size", type=int, default=None,
+                   help="ViT patch size. Defaults to 14 for 224px data and 4 for 64px data.")
+    p.add_argument("--use_proprio", action="store_true",
+                   help="Fuse proprioception instead of the paper's vision-only encoder.")
     return p.parse_args()
 
 
@@ -115,6 +123,27 @@ def train(args: argparse.Namespace) -> None:
         require_no_collision=False,
         num_workers=num_workers,
     )
+    channels, height, width = dataset.vision_shape
+    if channels != 3 or height != width:
+        raise ValueError(f"Expected square RGB inputs, got shape {dataset.vision_shape}")
+
+    image_size = args.image_size if args.image_size is not None else height
+    if image_size != height:
+        raise ValueError(
+            f"--image_size={image_size} does not match dataset resolution {height}"
+        )
+
+    if args.patch_size is not None:
+        patch_size = args.patch_size
+    elif image_size == 224:
+        patch_size = 14
+    elif image_size == 64:
+        patch_size = 4
+    else:
+        raise ValueError(
+            f"No default patch size for image_size={image_size}; pass --patch_size explicitly."
+        )
+
     dataloader = DataLoader(
         dataset,
         batch_size=None,
@@ -125,14 +154,19 @@ def train(args: argparse.Namespace) -> None:
 
     # ---- Model -------------------------------------------------------
     model = LeWorldModel(
-        latent_dim=256,
+        latent_dim=args.latent_dim,
         cmd_dim=3,
+        pred_hidden_dim=args.pred_hidden_dim,
         pred_layers=args.pred_layers,
         pred_heads=args.pred_heads,
         pred_dropout=args.pred_dropout,
+        max_seq_len=args.seq_len,
         sigreg_lambda=args.sigreg_lambda,
         sigreg_projections=args.sigreg_projections,
         sigreg_knots=args.sigreg_knots,
+        image_size=image_size,
+        patch_size=patch_size,
+        use_proprio=args.use_proprio,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -206,9 +240,9 @@ def train(args: argparse.Namespace) -> None:
             dones = dones.to(device, non_blocking=True)
             collisions = collisions.to(device, non_blocking=True)
 
-            # Transition mask: valid if next frame has no done/collision
-            # Shape: (B, T-1) — one per predicted transition
-            mask = ~(dones[:, 1:] | collisions[:, 1:])
+            # Keep soft-collision transitions in the loss so the predictor
+            # learns wall-contact dynamics; only reset/teleport boundaries are masked.
+            mask = ~dones[:, 1:]
 
             optimizer.zero_grad(set_to_none=True)
 

@@ -12,7 +12,7 @@ class GoalEnergyHead(nn.Module):
     Output: scalar energy (lower = more compatible).
     """
 
-    def __init__(self, latent_dim: int = 256, dropout: float = 0.0):
+    def __init__(self, latent_dim: int = 192, dropout: float = 0.0):
         super().__init__()
         in_dim = latent_dim * 4
         self.net = nn.Sequential(

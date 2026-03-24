@@ -1,0 +1,34 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Project-generated datasets and training artifacts
+jepa_raw_data/
+jepa_final_dataset*/
+lewm_checkpoints/
+lewm_logs/
+_textures/
+
+# Temporary render shards
+*_tmp_*.h5
+
+# Local model/checkpoint blobs
+models/ppo/*.pt
+*.ckpt

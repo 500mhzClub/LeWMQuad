@@ -1,49 +1,130 @@
-"""Vision, proprioception, joint encoders, and BatchNorm projector.
-
-Key change from TinyQuadJEPA-v2:
-  - The JointEncoder backbone retains LayerNorm for stable feature extraction.
-  - A separate **Projector** with BatchNorm maps backbone output into the
-    "comparison space" where SIGReg and the prediction MSE operate.
-  - BatchNorm (not LayerNorm) is required because SIGReg tests the *batch*
-    distribution against N(0, I); LayerNorm normalises per-sample and would
-    mask departures from Gaussianity.
-"""
+"""Vision encoder and BatchNorm projector for LeWorldModel."""
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
 
-# --------------------------------------------------------------------------- #
-# Backbone sub-encoders  (identical to TinyQuadJEPA-v2)
-# --------------------------------------------------------------------------- #
+class ViTBlock(nn.Module):
+    """Standard pre-norm ViT block."""
 
-class VisionEncoder(nn.Module):
-    """4-layer CNN: 64×64 RGB → feature_dim vector."""
-
-    def __init__(self, feature_dim: int = 128):
+    def __init__(
+        self,
+        hidden_dim: int,
+        n_heads: int,
+        mlp_ratio: int = 4,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, 4, 2, 1),  nn.ELU(),
-            nn.Conv2d(32, 64, 4, 2, 1), nn.ELU(),
-            nn.Conv2d(64, 128, 4, 2, 1), nn.ELU(),
-            nn.Conv2d(128, 256, 4, 2, 1), nn.ELU(),
-            nn.Flatten(),
-            nn.Linear(256 * 4 * 4, feature_dim),
-            nn.LayerNorm(feature_dim),
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(
+            hidden_dim,
+            n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * mlp_ratio),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * mlp_ratio, hidden_dim),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        h = self.norm1(x)
+        h, _ = self.attn(h, h, h, need_weights=False)
+        x = x + h
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class VisionEncoder(nn.Module):
+    """Paper-aligned ViT-Tiny observation encoder."""
+
+    def __init__(
+        self,
+        image_size: int = 224,
+        patch_size: int = 14,
+        hidden_dim: int = 192,
+        depth: int = 12,
+        n_heads: int = 3,
+        mlp_ratio: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if image_size % patch_size != 0:
+            raise ValueError(
+                f"image_size={image_size} must be divisible by patch_size={patch_size}"
+            )
+
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim
+        self.num_patches = (image_size // patch_size) ** 2
+
+        self.patch_embed = nn.Conv2d(
+            3,
+            hidden_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, hidden_dim))
+        self.pos_drop = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(
+            [
+                ViTBlock(
+                    hidden_dim=hidden_dim,
+                    n_heads=n_heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(
+                f"Expected vision tensor of shape (B, C, H, W), got {tuple(x.shape)}"
+            )
+        _, _, height, width = x.shape
+        if height != self.image_size or width != self.image_size:
+            raise ValueError(
+                f"Expected {self.image_size}x{self.image_size} inputs, got {height}x{width}"
+            )
+
+        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        cls = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        return x[:, 0]
 
 
 class ProprioEncoder(nn.Module):
-    """MLP: proprio_dim → feature_dim."""
+    """Optional proprio extension for quadruped experiments."""
 
-    def __init__(self, input_dim: int = 47, feature_dim: int = 128):
+    def __init__(self, input_dim: int = 47, feature_dim: int = 192):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.ELU(),
+            nn.Linear(input_dim, 256),
+            nn.GELU(),
             nn.Linear(256, feature_dim),
             nn.LayerNorm(feature_dim),
         )
@@ -52,41 +133,57 @@ class ProprioEncoder(nn.Module):
         return self.net(x)
 
 
-# --------------------------------------------------------------------------- #
-# Joint encoder  (backbone — ends with LayerNorm)
-# --------------------------------------------------------------------------- #
-
 class JointEncoder(nn.Module):
-    """Fuses vision + proprio into a single latent vector (backbone output)."""
+    """Wrapper around the paper encoder.
 
-    def __init__(self, latent_dim: int = 256):
+    The paper uses only pixels. ``use_proprio`` remains available as a local
+    extension, but is disabled by default so the backbone matches the paper.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 192,
+        image_size: int = 224,
+        patch_size: int = 14,
+        use_proprio: bool = False,
+        proprio_dim: int = 47,
+    ):
         super().__init__()
-        self.vis_enc = VisionEncoder(128)
-        self.prop_enc = ProprioEncoder(47, 128)
-        self.fusion = nn.Sequential(
-            nn.Linear(256, 256), nn.ELU(),
-            nn.Linear(256, latent_dim),
-            nn.LayerNorm(latent_dim),
+        self.use_proprio = use_proprio
+        self.vis_enc = VisionEncoder(
+            image_size=image_size,
+            patch_size=patch_size,
+            hidden_dim=latent_dim,
         )
+        if use_proprio:
+            self.prop_enc = ProprioEncoder(proprio_dim, latent_dim)
+            self.fusion = nn.Sequential(
+                nn.Linear(latent_dim * 2, latent_dim),
+                nn.GELU(),
+                nn.LayerNorm(latent_dim),
+            )
+        else:
+            self.prop_enc = None
+            self.fusion = None
 
-    def forward(self, vision: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
-        z = torch.cat([self.vis_enc(vision), self.prop_enc(proprio)], dim=-1)
+    def forward(
+        self,
+        vision: torch.Tensor,
+        proprio: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        z_vis = self.vis_enc(vision)
+        if not self.use_proprio:
+            return z_vis
+        if proprio is None:
+            raise ValueError("proprio is required when use_proprio=True")
+        z = torch.cat([z_vis, self.prop_enc(proprio)], dim=-1)
         return self.fusion(z)
 
 
-# --------------------------------------------------------------------------- #
-# Projector  (new — maps backbone → comparison space with BatchNorm)
-# --------------------------------------------------------------------------- #
-
 class Projector(nn.Module):
-    """1-layer MLP with BatchNorm (no affine) for SIGReg compatibility.
+    """1-layer MLP with BatchNorm for SIGReg compatibility."""
 
-    The paper notes that the ViT's final LayerNorm prevents SIGReg from
-    working; a BN projector fixes this.  Both the encoder and the predictor
-    share the same projector *architecture* (but separate weights).
-    """
-
-    def __init__(self, in_dim: int = 256, out_dim: int = 256):
+    def __init__(self, in_dim: int = 192, out_dim: int = 192):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, out_dim),
@@ -94,10 +191,8 @@ class Projector(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, D) or (B*T, D)."""
         return self.net(x)
 
     def forward_seq(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, D) — reshapes for BN then restores shape."""
-        B, T, D = x.shape
-        return self.net(x.reshape(B * T, -1)).reshape(B, T, -1)
+        batch, steps, _ = x.shape
+        return self.net(x.reshape(batch * steps, -1)).reshape(batch, steps, -1)

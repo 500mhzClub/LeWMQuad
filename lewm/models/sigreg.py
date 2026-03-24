@@ -52,7 +52,7 @@ def _epps_pulley(
 
 def sigreg(
     Z: torch.Tensor,
-    n_projections: int = 512,
+    n_projections: int = 1024,
     n_knots: int = 17,
     t_min: float = 0.2,
     t_max: float = 4.0,
@@ -94,7 +94,7 @@ def sigreg(
 
 def sigreg_stepwise(
     Z_seq: torch.Tensor,
-    n_projections: int = 512,
+    n_projections: int = 1024,
     n_knots: int = 17,
     t_min: float = 0.2,
     t_max: float = 4.0,

@@ -48,7 +48,7 @@ class StreamingJEPADataset(IterableDataset):
     def __init__(
         self,
         data_dir: str,
-        seq_len: int = 16,
+        seq_len: int = 4,
         batch_size: int = 256,
         require_no_done: bool = True,
         require_no_collision: bool = True,
@@ -65,6 +65,7 @@ class StreamingJEPADataset(IterableDataset):
         self.require_no_collision = require_no_collision
         self._num_workers = max(1, num_workers)
         self.load_labels = load_labels
+        self.vision_shape, self.proprio_dim = self._inspect_schema()
 
         # Pre-build index table: list of (file_path, env_idx, t0)
         # Scans dones/collisions at init (small arrays, ~10 MB total).
@@ -83,6 +84,26 @@ class StreamingJEPADataset(IterableDataset):
                     files.append(path)
                     seen.add(path)
         return files
+
+    def _inspect_schema(self) -> Tuple[Tuple[int, ...], int]:
+        with h5py.File(self.files[0], "r") as h5f:
+            vision_shape = tuple(int(x) for x in h5f["vision"].shape[2:])
+            proprio_dim = int(h5f["proprio"].shape[-1])
+
+        for fpath in self.files[1:]:
+            with h5py.File(fpath, "r") as h5f:
+                if tuple(int(x) for x in h5f["vision"].shape[2:]) != vision_shape:
+                    raise ValueError(
+                        f"Inconsistent vision shape in {fpath}: "
+                        f"{tuple(h5f['vision'].shape[2:])} != {vision_shape}"
+                    )
+                if int(h5f["proprio"].shape[-1]) != proprio_dim:
+                    raise ValueError(
+                        f"Inconsistent proprio dim in {fpath}: "
+                        f"{int(h5f['proprio'].shape[-1])} != {proprio_dim}"
+                    )
+
+        return vision_shape, proprio_dim
 
     def _precompute_indices(self) -> List[Tuple[str, int, int]]:
         indices = []
@@ -134,8 +155,8 @@ class StreamingJEPADataset(IterableDataset):
                 if B == 0:
                     continue
 
-                vis = np.empty((B, self.seq_len, 3, 64, 64), dtype=np.uint8)
-                prop = np.empty((B, self.seq_len, 47), dtype=np.float32)
+                vis = np.empty((B, self.seq_len, *self.vision_shape), dtype=np.uint8)
+                prop = np.empty((B, self.seq_len, self.proprio_dim), dtype=np.float32)
                 cmds = np.empty((B, self.seq_len, 3), dtype=np.float32)
                 dones = np.zeros((B, self.seq_len), dtype=np.bool_)
                 collisions = np.zeros((B, self.seq_len), dtype=np.bool_)
