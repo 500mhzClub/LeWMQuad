@@ -13,11 +13,16 @@ from torch.utils.data import IterableDataset
 
 
 class StreamingJEPADataset(IterableDataset):
-    """Yields (vision, proprio, cmds, dones, collisions) sequence tuples.
+    """Yields (vision, proprio, cmds, dones, collisions, labels) sequence tuples.
 
     Streams directly from HDF5 files — no full-dataset RAM copy.  Sequence
     indices are pre-built at init and sharded across all workers by index
     (not by file), so all num_workers are active regardless of file count.
+
+    The *labels* dict contains optional supervision signals added by the
+    extended data pipeline: clearance, near_miss, traversability,
+    beacon_visible, beacon_identity, beacon_bearing, beacon_range, cmd_pattern.
+    Missing fields are filled with zeros/defaults.
 
     Args:
         data_dir: directory containing rendered chunk files (``*_rgb.h5``).
@@ -25,7 +30,20 @@ class StreamingJEPADataset(IterableDataset):
         batch_size: worker-side micro-batch size.
         require_no_done: skip sequences that contain a ``done`` flag.
         require_no_collision: skip sequences that contain a ``collision`` flag.
+        load_labels: whether to load extended label fields.
     """
+
+    # Extended label fields and their (dtype, default_value) specs
+    LABEL_FIELDS = {
+        "clearance":        (np.float32, 999.0),
+        "near_miss":        (np.bool_,   False),
+        "traversability":   (np.int32,   10),
+        "beacon_visible":   (np.bool_,   False),
+        "beacon_identity":  (np.int32,   -1),
+        "beacon_bearing":   (np.float32, 0.0),
+        "beacon_range":     (np.float32, 999.0),
+        "cmd_pattern":      (np.int32,   0),
+    }
 
     def __init__(
         self,
@@ -35,6 +53,7 @@ class StreamingJEPADataset(IterableDataset):
         require_no_done: bool = True,
         require_no_collision: bool = True,
         num_workers: int = 1,
+        load_labels: bool = True,
     ):
         super().__init__()
         self.files: List[str] = self._discover_files(data_dir)
@@ -45,6 +64,7 @@ class StreamingJEPADataset(IterableDataset):
         self.require_no_done = require_no_done
         self.require_no_collision = require_no_collision
         self._num_workers = max(1, num_workers)
+        self.load_labels = load_labels
 
         # Pre-build index table: list of (file_path, env_idx, t0)
         # Scans dones/collisions at init (small arrays, ~10 MB total).
@@ -120,6 +140,13 @@ class StreamingJEPADataset(IterableDataset):
                 dones = np.zeros((B, self.seq_len), dtype=np.bool_)
                 collisions = np.zeros((B, self.seq_len), dtype=np.bool_)
 
+                # Pre-allocate label arrays
+                label_arrays = {}
+                if self.load_labels:
+                    for field, (dtype, default) in self.LABEL_FIELDS.items():
+                        arr = np.full((B, self.seq_len), default, dtype=dtype)
+                        label_arrays[field] = arr
+
                 for i, (fpath, e, t0) in enumerate(batch_idx):
                     if fpath not in open_files:
                         open_files[fpath] = h5py.File(fpath, "r")
@@ -133,12 +160,25 @@ class StreamingJEPADataset(IterableDataset):
                     if "collisions" in h5f:
                         collisions[i] = h5f["collisions"][e, t0:t1]
 
+                    # Load extended labels if available
+                    if self.load_labels:
+                        for field in self.LABEL_FIELDS:
+                            if field in h5f:
+                                label_arrays[field][i] = h5f[field][e, t0:t1]
+
+                # Build label dict of tensors
+                labels = {}
+                if self.load_labels:
+                    for field, arr in label_arrays.items():
+                        labels[field] = torch.from_numpy(arr)
+
                 yield (
                     torch.from_numpy(vis),
                     torch.from_numpy(prop),
                     torch.from_numpy(cmds),
                     torch.from_numpy(dones),
                     torch.from_numpy(collisions),
+                    labels,
                 )
         finally:
             for f in open_files.values():

@@ -1,0 +1,1 @@
+- [project_lewmquad.md](project_lewmquad.md) — LeWMQuad project context: architecture conversion from EMA-JEPA to LeWorldModel, status, key decisions

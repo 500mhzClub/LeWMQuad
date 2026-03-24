@@ -194,7 +194,11 @@ def train(args: argparse.Namespace) -> None:
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
         for batch in pbar:
-            vision, proprio, cmds, dones, collisions = batch
+            # Dataset returns 5-tuple (old) or 6-tuple (new, with labels dict)
+            if len(batch) == 6:
+                vision, proprio, cmds, dones, collisions, _labels = batch
+            else:
+                vision, proprio, cmds, dones, collisions = batch
 
             vision = vision.to(device, non_blocking=True).float().div_(255.0)
             proprio = proprio.to(device, non_blocking=True)
