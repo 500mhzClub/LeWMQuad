@@ -36,7 +36,7 @@ import torch
 from tqdm import tqdm
 
 from lewm.math_utils import forward_up_from_quat
-from lewm.genesis_utils import init_genesis_once, to_numpy
+from lewm.genesis_utils import to_numpy
 from lewm.texture_utils import generate_texture_set
 from lewm.obstacle_utils import ObstacleLayout
 from lewm.beacon_utils import BeaconLayout, beacon_like_wall_color
@@ -73,6 +73,39 @@ CAM_LOOKAT_JITTER = 0.012
 # --------------------------------------------------------------------------- #
 # Visual domain randomization
 # --------------------------------------------------------------------------- #
+
+def pick_backend(gs, backend_str: str):
+    """Match the older TinyQuadJEPA backend selection path."""
+    backend_str = backend_str.lower().strip()
+    if backend_str == "vulkan":
+        return gs.vulkan
+    if backend_str in ("amdgpu", "amd", "hip") and hasattr(gs, "amdgpu"):
+        return gs.amdgpu
+    if backend_str in ("cuda",) and hasattr(gs, "cuda"):
+        return gs.cuda
+    if backend_str in ("metal",) and hasattr(gs, "metal"):
+        return gs.metal
+    if backend_str in ("cpu",):
+        return gs.cpu
+    return gs.gpu
+
+
+def opened_render_nodes() -> list[str]:
+    """Best-effort introspection of DRM render nodes opened by this process."""
+    fd_dir = "/proc/self/fd"
+    nodes = []
+    try:
+        for entry in os.listdir(fd_dir):
+            path = os.path.join(fd_dir, entry)
+            try:
+                target = os.readlink(path)
+            except OSError:
+                continue
+            if "/dev/dri/renderD" in target:
+                nodes.append(target)
+    except OSError:
+        return []
+    return sorted(set(nodes))
 
 def apply_visual_domain_randomization(rgb: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
     """Apply per-frame visual domain randomization to an (H, W, 3) uint8 image."""
@@ -140,16 +173,7 @@ def build_render_bundle(
     beacon_confuse_prob: float = 0.3,
 ):
     """Construct one textured render scene variant with beacon panels."""
-    scene = gs.Scene(
-        show_viewer=False,
-        vis_options=gs.options.VisOptions(
-            plane_reflection=False,
-            show_world_frame=False,
-            show_link_frame=False,
-            show_cameras=False,
-        ),
-        renderer=gs.renderers.Rasterizer(),
-    )
+    scene = gs.Scene(show_viewer=False)
 
     scene.add_entity(
         morph=gs.morphs.Plane(),
@@ -215,9 +239,9 @@ def render_worker(args_tuple):
 
     import genesis as gs
     import torch
-    import logging as _logging
 
-    init_genesis_once(sim_backend, logging_level=_logging.ERROR)
+    backend_obj = pick_backend(gs, sim_backend)
+    gs.init(backend=backend_obj, logging_level="warning")
     texture_count = max(1, int(texture_count))
     texture_variants = max(1, int(texture_variants))
     worker_seed = worker_id + int.from_bytes(os.urandom(4), "little")
@@ -248,6 +272,9 @@ def render_worker(args_tuple):
         )
         for variant_offset, texture_idx in enumerate(variant_ids)
     ]
+    render_nodes = opened_render_nodes()
+    if render_nodes:
+        print(f"[worker {worker_id}] DRM render nodes: {', '.join(render_nodes)}", flush=True)
     env_bundle_ids = worker_rng.randint(0, len(bundles), size=N_subset)
 
     data = np.load(chunk_file, allow_pickle=True)
