@@ -46,6 +46,7 @@ if REPO_ROOT not in sys.path:
 import numpy as np
 import torch
 import genesis as gs
+from tqdm import tqdm
 
 from lewm.models.ppo import ActorCritic
 from lewm.math_utils import world_to_body_vec, yaw_to_quat
@@ -338,6 +339,14 @@ def main() -> None:
     # -------------------------------------------------------------------- #
     # Chunk loop
     # -------------------------------------------------------------------- #
+    total_steps_all = args.chunks * args.steps
+    global_pbar = tqdm(
+        total=total_steps_all,
+        unit="step",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} steps [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+
     for chunk_idx in range(args.chunks):
         chunk_seed = args.seed + chunk_idx
         print(f"--- Chunk {chunk_idx + 1}/{args.chunks} (seed={chunk_seed}) ---")
@@ -528,15 +537,12 @@ def main() -> None:
                         d_joint_pos[batch_slice, step] = q.cpu()
                         d_collisions[batch_slice, step] = colliding.cpu()
 
-                        if (step + 1) % max(1, args.steps // 10) == 0:
-                            elapsed = time.time() - t0
-                            env_steps_done = env_start * args.steps + batch_n_envs * (step + 1)
-                            fps = env_steps_done / elapsed
-                            print(
-                                f"  Batch {batch_idx + 1}/{n_scene_batches} | "
-                                f"Step {step + 1:>6d}/{args.steps}  |  "
-                                f"FPS: {fps:,.0f}  |  resets so far: {total_resets}"
-                            )
+                        global_pbar.update(1)
+                        global_pbar.set_description(
+                            f"Chunk {chunk_idx + 1}/{args.chunks} | "
+                            f"step {step + 1}/{args.steps} | "
+                            f"resets {total_resets}"
+                        )
                 finally:
                     if scene is not None:
                         scene.destroy()
@@ -613,6 +619,7 @@ def main() -> None:
         print(f"  Saved {chunk_path} ({size_mb:.1f} MB)  |  "
               f"Chunk FPS: {chunk_fps:,.0f}  |  Total resets: {total_resets}\n")
 
+    global_pbar.close()
     print("Physics rollout complete.")
 
 
