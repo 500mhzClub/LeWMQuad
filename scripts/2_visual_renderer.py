@@ -126,6 +126,18 @@ def opened_render_nodes() -> list[str]:
         return []
     return sorted(set(nodes))
 
+
+def normalize_h5_compression(name: str | None) -> str | None:
+    """Map CLI compression names onto h5py's expected values."""
+    if name is None:
+        return None
+    name = str(name).strip().lower()
+    if name in {"", "none", "off", "false", "0"}:
+        return None
+    if name in {"gzip", "lzf"}:
+        return name
+    raise ValueError(f"Unsupported HDF5 compression '{name}'. Use one of: none, gzip, lzf.")
+
 def apply_visual_domain_randomization(rgb: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
     """Apply per-frame visual domain randomization to an (H, W, 3) uint8 image."""
     img = rgb.astype(np.float32) / 255.0
@@ -243,7 +255,8 @@ def render_worker(args_tuple):
     """Each worker renders a subset of environments from one .npz chunk."""
     (worker_id, chunk_file, start_env, end_env,
      tmp_file, sim_backend, texture_dir, obstacle_json, beacon_json,
-     texture_count, texture_variants, beacon_confuse_prob, img_res, progress_queue) = args_tuple
+     texture_count, texture_variants, beacon_confuse_prob, img_res,
+     tmp_vision_compression, progress_queue) = args_tuple
 
     N_subset = end_env - start_env
 
@@ -310,7 +323,10 @@ def render_worker(args_tuple):
 
     with h5py.File(tmp_file, "w") as f:
         h5_vision = f.create_dataset(
-            "vision", (N_subset, T, 3, img_res, img_res), dtype="uint8", compression="gzip",
+            "vision",
+            (N_subset, T, 3, img_res, img_res),
+            dtype="uint8",
+            compression=tmp_vision_compression,
         )
 
         for local_idx, env_idx in enumerate(range(start_env, end_env)):
@@ -397,6 +413,7 @@ def stitch_hdf5(
     N: int,
     T: int,
     img_res: int,
+    vision_compression: str | None,
 ) -> None:
     """Merge per-worker HDF5 shards and raw data into one final HDF5 file."""
     tmp_out = out_path + ".stitching"
@@ -406,7 +423,7 @@ def stitch_hdf5(
                 "vision", (N, T, 3, img_res, img_res),
                 dtype="uint8",
                 chunks=(1, T, 3, img_res, img_res),
-                compression="gzip",
+                compression=vision_compression,
             )
 
             h5f.create_dataset("proprio", data=data["proprio"], compression="gzip")
@@ -477,7 +494,22 @@ def main():
     parser.add_argument("--img_res", type=int, default=DEFAULT_IMG_RES)
     parser.add_argument("--beacon_confuse_prob", type=float, default=0.3,
                         help="Probability that a wall gets a beacon-like colour.")
+    parser.add_argument(
+        "--tmp_vision_compression",
+        type=str,
+        default="none",
+        help="Compression for per-worker temporary vision shards: none | gzip | lzf",
+    )
+    parser.add_argument(
+        "--final_vision_compression",
+        type=str,
+        default="gzip",
+        help="Compression for final stitched vision datasets: none | gzip | lzf",
+    )
     args = parser.parse_args()
+
+    tmp_vision_compression = normalize_h5_compression(args.tmp_vision_compression)
+    final_vision_compression = normalize_h5_compression(args.final_vision_compression)
 
     effective_workers = max(1, int(args.workers))
     effective_texture_variants = max(1, int(args.texture_variants_per_worker))
@@ -609,7 +641,7 @@ def main():
                     i, file_path, start, end, tmp,
                     args.sim_backend, texture_dir, obstacle_json, beacon_json,
                     args.texture_count, effective_texture_variants,
-                    args.beacon_confuse_prob, args.img_res,
+                    args.beacon_confuse_prob, args.img_res, tmp_vision_compression,
                 ))
 
             progress_queue = mp.Queue()
@@ -649,7 +681,16 @@ def main():
                 )
 
             pbar.set_description(f"{chunk_label}  stitching...")
-            stitch_hdf5(out_path, tmp_files, tasks, data, N, T, args.img_res)
+            stitch_hdf5(
+                out_path,
+                tmp_files,
+                tasks,
+                data,
+                N,
+                T,
+                args.img_res,
+                final_vision_compression,
+            )
             tqdm.write(f"  {chunk_name} done  ({N} envs, {T} steps)  ->  {out_path}")
 
     tqdm.write("All chunks rendered.")
