@@ -48,26 +48,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--seq_len", type=int, default=4)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--warmup_steps", type=int, default=1000,
                     help="Number of linear LR warmup steps before cosine decay.")
-    p.add_argument("--weight_decay", type=float, default=1e-5)
+    p.add_argument("--weight_decay", type=float, default=1e-3)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--resume_from", type=str, default=None)
     p.add_argument("--out_dir", type=str, default="lewm_checkpoints")
     p.add_argument("--log_dir", type=str, default="lewm_logs")
     # LeWM-specific hypers
-    p.add_argument("--sigreg_lambda", type=float, default=0.1,
+    p.add_argument("--sigreg_lambda", type=float, default=0.09,
                     help="Weight λ for SIGReg regularisation (only tunable hyper).")
     p.add_argument("--sigreg_projections", type=int, default=1024,
                     help="Number of random projections M in SIGReg.")
     p.add_argument("--sigreg_knots", type=int, default=17,
                     help="Number of quadrature knots for Epps-Pulley test.")
     p.add_argument("--latent_dim", type=int, default=192)
-    p.add_argument("--pred_hidden_dim", type=int, default=384)
     p.add_argument("--pred_layers", type=int, default=6)
     p.add_argument("--pred_heads", type=int, default=16)
+    p.add_argument("--pred_dim_head", type=int, default=64)
+    p.add_argument("--pred_mlp_dim", type=int, default=2048)
     p.add_argument("--pred_dropout", type=float, default=0.1)
     p.add_argument("--image_size", type=int, default=None,
                    help="Input image size. Defaults to the rendered dataset size.")
@@ -157,9 +158,10 @@ def train(args: argparse.Namespace) -> None:
     model = LeWorldModel(
         latent_dim=args.latent_dim,
         cmd_dim=3,
-        pred_hidden_dim=args.pred_hidden_dim,
         pred_layers=args.pred_layers,
         pred_heads=args.pred_heads,
+        pred_dim_head=args.pred_dim_head,
+        pred_mlp_dim=args.pred_mlp_dim,
         pred_dropout=args.pred_dropout,
         max_seq_len=args.seq_len,
         sigreg_lambda=args.sigreg_lambda,

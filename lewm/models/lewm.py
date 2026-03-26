@@ -27,21 +27,22 @@ from .sigreg import sigreg_stepwise
 class LeWorldModel(nn.Module):
     """End-to-end latent world model with SIGReg regularisation.
 
-    Defaults follow the paper: ViT-Tiny encoder, ViT-S-sized predictor path,
-    BatchNorm projectors, and a vision-only backbone.
+    Defaults follow the official le-wm repo: ViT-Tiny encoder, 192-dim
+    predictor with 16×64 attention heads, BatchNorm projectors.
     """
 
     def __init__(
         self,
         latent_dim: int = 192,
         cmd_dim: int = 3,
-        pred_hidden_dim: int = 384,
         pred_layers: int = 6,
         pred_heads: int = 16,
-        pred_mlp_ratio: int = 4,
+        pred_dim_head: int = 64,
+        pred_mlp_dim: int = 2048,
         pred_dropout: float = 0.1,
+        pred_emb_dropout: float = 0.0,
         max_seq_len: int = 4,
-        sigreg_lambda: float = 0.1,
+        sigreg_lambda: float = 0.09,
         sigreg_projections: int = 1024,
         sigreg_knots: int = 17,
         image_size: int = 224,
@@ -64,12 +65,13 @@ class LeWorldModel(nn.Module):
 
         self.predictor = TransformerPredictor(
             latent_dim=latent_dim,
-            hidden_dim=pred_hidden_dim,
             cmd_dim=cmd_dim,
             n_layers=pred_layers,
             n_heads=pred_heads,
-            mlp_ratio=pred_mlp_ratio,
+            dim_head=pred_dim_head,
+            mlp_dim=pred_mlp_dim,
             dropout=pred_dropout,
+            emb_dropout=pred_emb_dropout,
             max_seq_len=max_seq_len,
         )
         self.pred_projector = Projector(latent_dim, latent_dim)

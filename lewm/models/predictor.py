@@ -1,183 +1,266 @@
-"""Transformer predictor with AdaLN action conditioning."""
-from __future__ import annotations
+"""Transformer predictor with AdaLN-zero action conditioning.
 
-from typing import Optional
+Matches the official le-wm architecture (module.py):
+  - Custom attention: dim_head=64, 16 heads -> 1024 total attention dim
+  - Double LayerNorm: AdaLN (elementwise_affine=False) + internal affine LN
+  - F.scaled_dot_product_attention with is_causal=True
+  - Conv1d + MLP action encoder (Embedder)
+  - 192-dim residual stream throughout (no up-projection)
+
+Reference:
+    Official le-wm repo: github.com/facebookresearch/le-wm
+"""
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class AdaLNZero(nn.Module):
-    """DiT-style AdaLN-zero block modulation.
+# ---------------------------------------------------------------------- #
+# Helpers
+# ---------------------------------------------------------------------- #
 
-    Projects the conditioning vector to 6*hidden_dim:
-    (shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp).
-    All projections are zero-initialised so action conditioning is a no-op
-    at the start of training and opens up gradually.
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """AdaLN-zero modulation: x * (1 + scale) + shift."""
+    return x * (1 + scale) + shift
+
+
+# ---------------------------------------------------------------------- #
+# Action encoder
+# ---------------------------------------------------------------------- #
+
+class ActionEmbedder(nn.Module):
+    """Matches the official le-wm ``Embedder`` class.
+
+    Conv1d smoothing over the time axis followed by an MLP projection.
     """
-
-    def __init__(self, hidden_dim: int, cond_dim: int):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-        self.proj = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 6 * hidden_dim))
-        nn.init.zeros_(self.proj[-1].weight)
-        nn.init.zeros_(self.proj[-1].bias)
-
-    def modulate(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return self.norm1(x) * (1.0 + scale) + shift
-
-    def forward_params(self, cond: torch.Tensor):
-        return self.proj(cond).chunk(6, dim=-1)
-
-
-class TransformerBlock(nn.Module):
-    """Pre-norm transformer block with DiT-style AdaLN-zero conditioning."""
 
     def __init__(
         self,
-        hidden_dim: int,
-        n_heads: int,
-        cond_dim: int,
-        mlp_ratio: int = 4,
-        dropout: float = 0.1,
+        input_dim: int = 3,
+        smoothed_dim: int = 10,
+        emb_dim: int = 192,
+        mlp_scale: int = 4,
     ):
         super().__init__()
-        self.adaln = AdaLNZero(hidden_dim, cond_dim)
-        self.attn = nn.MultiheadAttention(
-            hidden_dim,
-            n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * mlp_ratio),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * mlp_ratio, hidden_dim),
-            nn.Dropout(dropout),
+        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
+        self.embed = nn.Sequential(
+            nn.Linear(smoothed_dim, mlp_scale * emb_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_scale * emb_dim, emb_dim),
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        cond: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.adaln.forward_params(cond)
-
-        # Attention with AdaLN-zero gating
-        h = self.adaln.norm1(x) * (1.0 + scale_a) + shift_a
-        h, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
-        x = x + gate_a * h
-
-        # MLP with AdaLN-zero gating
-        h = self.adaln.norm2(x) * (1.0 + scale_m) + shift_m
-        x = x + gate_m * self.mlp(h)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, D)"""
+        x = x.float()
+        x = x.permute(0, 2, 1)       # (B, D, T) for Conv1d
+        x = self.patch_embed(x)
+        x = x.permute(0, 2, 1)       # (B, T, D')
+        x = self.embed(x)
         return x
 
 
-class TransformerPredictor(nn.Module):
-    """Paper-aligned latent dynamics model.
+# ---------------------------------------------------------------------- #
+# Attention & FeedForward (with internal LayerNorm — double-norm pattern)
+# ---------------------------------------------------------------------- #
 
-    The paper uses a ViT-S-sized hidden path: 6 layers, 16 heads, 10% dropout,
-    with a 192-D latent projected into a 384-D transformer hidden space.
+class Attention(nn.Module):
+    """Scaled dot-product attention with internal LayerNorm.
+
+    Uses dim_head=64 so total attention dim = heads * dim_head (e.g. 1024).
+    The QKV projection goes from ``dim`` -> ``inner_dim * 3``, and the output
+    projection goes from ``inner_dim`` -> ``dim``, allowing a wider attention
+    bottleneck than the residual stream.
+    """
+
+    def __init__(self, dim: int, heads: int = 16, dim_head: int = 64, dropout: float = 0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.dim_head = dim_head
+        self.dropout = dropout
+        self.norm = nn.LayerNorm(dim)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = (
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out
+            else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
+        """x: (B, T, D)"""
+        x = self.norm(x)
+        drop = self.dropout if self.training else 0.0
+
+        B, T, _ = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = (
+            t.reshape(B, T, self.heads, self.dim_head).permute(0, 2, 1, 3)
+            for t in qkv
+        )  # (B, heads, T, dim_head)
+
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        out = out.permute(0, 2, 1, 3).reshape(B, T, -1)  # (B, T, inner_dim)
+        return self.to_out(out)
+
+
+class FeedForward(nn.Module):
+    """FeedForward with internal LayerNorm (double-norm pattern)."""
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ---------------------------------------------------------------------- #
+# ConditionalBlock (DiT-style AdaLN-zero)
+# ---------------------------------------------------------------------- #
+
+class ConditionalBlock(nn.Module):
+    """Transformer block with AdaLN-zero conditioning.
+
+    Double LayerNorm: the outer ``norm1``/``norm2`` (elementwise_affine=False)
+    are modulated by AdaLN, and Attention/FeedForward have their own internal
+    affine LayerNorm.  Zero-init on the modulation projection ensures the
+    action conditioning is a no-op at the start of training.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True)
+        )
+        # Zero-init so conditioning opens up gradually
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(cond).chunk(6, dim=-1)
+        )
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+# ---------------------------------------------------------------------- #
+# TransformerPredictor  (official ARPredictor + Transformer, merged)
+# ---------------------------------------------------------------------- #
+
+class TransformerPredictor(nn.Module):
+    """Autoregressive predictor matching the official le-wm architecture.
+
+    192-dim residual stream, 16 heads x 64 dim_head = 1024 attention dim,
+    2048-dim FFN, AdaLN-zero conditioning, causal attention.
     """
 
     def __init__(
         self,
         latent_dim: int = 192,
-        hidden_dim: int = 384,
         cmd_dim: int = 3,
         n_layers: int = 6,
         n_heads: int = 16,
-        mlp_ratio: int = 4,
+        dim_head: int = 64,
+        mlp_dim: int = 2048,
         dropout: float = 0.1,
+        emb_dropout: float = 0.0,
         max_seq_len: int = 4,
     ):
         super().__init__()
-        if hidden_dim % n_heads != 0:
-            raise ValueError(
-                f"hidden_dim={hidden_dim} must be divisible by n_heads={n_heads}"
-            )
-
         self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
 
-        self.action_embed = nn.Sequential(
-            nn.Linear(cmd_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.input_proj = nn.Linear(latent_dim, hidden_dim)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, hidden_dim))
-        self.input_drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList(
-            [
-                TransformerBlock(
-                    hidden_dim=hidden_dim,
-                    n_heads=n_heads,
-                    cond_dim=hidden_dim,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                )
-                for _ in range(n_layers)
-            ]
-        )
-        self.output_proj = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, latent_dim),
+        # Action encoder (official Embedder)
+        self.action_embed = ActionEmbedder(
+            input_dim=cmd_dim, smoothed_dim=10, emb_dim=latent_dim,
         )
 
-        self._init_weights()
+        # Positional embedding (randn-initialized, matching official)
+        self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len, latent_dim))
+        self.input_drop = nn.Dropout(emb_dropout)
 
-    def _init_weights(self) -> None:
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        # Exclude AdaLN-zero projections — those are zero-inited in AdaLNZero.__init__
-        adaln_proj_linears = {block.adaln.proj[-1] for block in self.blocks}
-        for module in self.modules():
-            if isinstance(module, nn.Linear) and module not in adaln_proj_linears:
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            ConditionalBlock(latent_dim, n_heads, dim_head, mlp_dim, dropout)
+            for _ in range(n_layers)
+        ])
 
-    @staticmethod
-    def _causal_mask(steps: int, device: torch.device) -> torch.Tensor:
-        return torch.triu(
-            torch.ones(steps, steps, device=device, dtype=torch.bool),
-            diagonal=1,
-        )
+        # Final LayerNorm (matches official Transformer.norm)
+        self.norm = nn.LayerNorm(latent_dim)
 
     def forward(
         self,
         z_seq: torch.Tensor,
         cmd_seq: torch.Tensor,
     ) -> torch.Tensor:
+        """Predict next-step embeddings.
+
+        Args:
+            z_seq:   (B, T, D) — latent observation embeddings.
+            cmd_seq: (B, T, cmd_dim) — raw action/command sequence.
+
+        Returns:
+            (B, T, D) — predicted embeddings at each step.
+        """
         batch, steps, _ = z_seq.shape
         if steps > self.max_seq_len:
             raise ValueError(
                 f"Sequence length {steps} exceeds max_seq_len={self.max_seq_len}"
             )
 
-        x = self.input_proj(z_seq)
-        x = self.input_drop(x + self.pos_embed[:, :steps, :])
+        x = z_seq + self.pos_embed[:, :steps]
+        x = self.input_drop(x)
         cond = self.action_embed(cmd_seq)
-        mask = self._causal_mask(steps, z_seq.device)
 
         for block in self.blocks:
-            x = block(x, cond, attn_mask=mask)
+            x = block(x, cond)
 
-        return self.output_proj(x)
+        x = self.norm(x)
+        return x
+
+    # ------------------------------------------------------------------ #
+    # Rollout / inference helpers
+    # ------------------------------------------------------------------ #
 
     def rollout(
         self,
         z_start: torch.Tensor,
         action_seq: torch.Tensor,
     ) -> torch.Tensor:
-        batch, horizon, _ = action_seq.shape
-        _ = batch
+        """Auto-regressive rollout for latent planning.
 
+        Args:
+            z_start:    (B, D) — initial latent embedding.
+            action_seq: (B, H, cmd_dim) — candidate action sequence.
+
+        Returns:
+            (B, H, D) — predicted latents at each step.
+        """
+        batch, horizon, _ = action_seq.shape
         z_buffer = [z_start.unsqueeze(1)]
         preds = []
 
@@ -196,4 +279,5 @@ class TransformerPredictor(nn.Module):
         z_history: torch.Tensor,
         cmd_history: torch.Tensor,
     ) -> torch.Tensor:
+        """Single-step prediction from history context."""
         return self.forward(z_history, cmd_history)[:, -1, :]
