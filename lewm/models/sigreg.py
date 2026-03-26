@@ -34,19 +34,23 @@ def sigreg(
     Returns:
         Scalar SIGReg loss scaled by B.
     """
+    orig_dtype = Z.dtype
+    # Run in float32 for numerical stability (safe under bfloat16 autocast)
+    Z = Z.float()
+
     B, D = Z.shape
 
     # Random unit-norm directions on S^{D-1}
-    u = torch.randn(D, n_projections, device=Z.device, dtype=Z.dtype)
+    u = torch.randn(D, n_projections, device=Z.device, dtype=torch.float32)
     u = u / u.norm(p=2, dim=0)
 
     # Project embeddings:  h^(m) = Z @ u^(m),  shape (B, M)
     h = Z @ u
 
     # Quadrature nodes t in [0, 3], trapezoid weights, Gaussian window w(t)
-    t_nodes = torch.linspace(0.0, 3.0, n_knots, device=Z.device, dtype=Z.dtype)
+    t_nodes = torch.linspace(0.0, 3.0, n_knots, device=Z.device, dtype=torch.float32)
     dt = 3.0 / (n_knots - 1)
-    trap_w = torch.full((n_knots,), 2 * dt, device=Z.device, dtype=Z.dtype)
+    trap_w = torch.full((n_knots,), 2 * dt, device=Z.device, dtype=torch.float32)
     trap_w[0] = dt
     trap_w[-1] = dt
     window = torch.exp(-0.5 * t_nodes * t_nodes)   # w(t) = exp(-t²/2)
@@ -60,8 +64,7 @@ def sigreg(
     diff_sq = (ecf_real - window.unsqueeze(0)).square() + ecf_imag.square()
     statistic = (diff_sq * weights.unsqueeze(0)).sum(dim=-1)  # (M,)
 
-    # Scale by B to keep lambda-scale consistent with official repo
-    return statistic.mean() * B
+    return statistic.mean().to(orig_dtype)
 
 
 def sigreg_stepwise(

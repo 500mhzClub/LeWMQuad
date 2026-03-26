@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import sys
 import time
@@ -262,8 +263,8 @@ def train(args: argparse.Namespace) -> None:
                 model.parameters(), max_norm=args.grad_clip,
             ).item()
 
-            if not torch.isfinite(total_loss):
-                print(f"\n  WARNING: non-finite loss={total_loss.item():.4f} at step {global_step}, skipping update.")
+            if not torch.isfinite(total_loss) or not math.isfinite(grad_norm):
+                print(f"\n  WARNING: non-finite loss={total_loss.item():.4f} or grad_norm={grad_norm:.4f} at step {global_step}, skipping update.")
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
