@@ -9,8 +9,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *__pycache__*
-
-
+*.pyc
+*lewm/data/__pycache__/*
 # Virtual environments
 .venv/
 venv/
