@@ -22,10 +22,10 @@ def sigreg(
 ) -> torch.Tensor:
     """Compute the SIGReg loss for a batch of embeddings.
 
-    Formula matches the official le-wm repo:
+    Matches the official le-wm repo exactly:
       - t in [0, 3] with Gaussian window w(t) = exp(-t²/2)
-      - Computation runs in float32 for bfloat16 stability (no B-scaling;
-        official repo scales by B — equivalent to lambda/B here)
+      - Result scaled by B (so lambda=0.1 has correct magnitude)
+      - Computation runs in float32 for numerical stability under bfloat16 autocast
 
     Args:
         Z: (B, D) batch of latent embeddings.
@@ -33,7 +33,7 @@ def sigreg(
         n_knots: number of trapezoid quadrature nodes K.
 
     Returns:
-        Scalar SIGReg loss (mean over projections).
+        Scalar SIGReg loss scaled by B.
     """
     orig_dtype = Z.dtype
     # Run in float32 for numerical stability (safe under bfloat16 autocast)
@@ -65,7 +65,8 @@ def sigreg(
     diff_sq = (ecf_real - window.unsqueeze(0)).square() + ecf_imag.square()
     statistic = (diff_sq * weights.unsqueeze(0)).sum(dim=-1)  # (M,)
 
-    return statistic.mean().to(orig_dtype)
+    # Scale by B to keep lambda-scale consistent with official repo
+    return (statistic.mean() * B).to(orig_dtype)
 
 
 def sigreg_stepwise(
