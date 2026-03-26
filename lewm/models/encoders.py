@@ -181,13 +181,18 @@ class JointEncoder(nn.Module):
 
 
 class Projector(nn.Module):
-    """1-layer MLP with BatchNorm for SIGReg compatibility."""
+    """2-layer MLP with BatchNorm for SIGReg compatibility.
 
-    def __init__(self, in_dim: int = 192, out_dim: int = 192):
+    Matches the official le-wm repo: Linear→BN→GELU→Linear with 2048 hidden.
+    """
+
+    def __init__(self, in_dim: int = 192, out_dim: int = 192, hidden_dim: int = 2048):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.BatchNorm1d(out_dim),
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
