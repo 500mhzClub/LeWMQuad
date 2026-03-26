@@ -7,23 +7,32 @@ import torch
 import torch.nn as nn
 
 
-class AdaLN(nn.Module):
-    """Adaptive LayerNorm conditioned on per-step actions."""
+class AdaLNZero(nn.Module):
+    """DiT-style AdaLN-zero block modulation.
+
+    Projects the conditioning vector to 6*hidden_dim:
+    (shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp).
+    All projections are zero-initialised so action conditioning is a no-op
+    at the start of training and opens up gradually.
+    """
 
     def __init__(self, hidden_dim: int, cond_dim: int):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-        self.proj = nn.Linear(cond_dim, 2 * hidden_dim)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.proj = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 6 * hidden_dim))
+        nn.init.zeros_(self.proj[-1].weight)
+        nn.init.zeros_(self.proj[-1].bias)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        scale, shift = self.proj(cond).chunk(2, dim=-1)
-        return self.norm(x) * (1.0 + scale) + shift
+    def modulate(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return self.norm1(x) * (1.0 + scale) + shift
+
+    def forward_params(self, cond: torch.Tensor):
+        return self.proj(cond).chunk(6, dim=-1)
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block with AdaLN."""
+    """Pre-norm transformer block with DiT-style AdaLN-zero conditioning."""
 
     def __init__(
         self,
@@ -34,14 +43,13 @@ class TransformerBlock(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.adaln1 = AdaLN(hidden_dim, cond_dim)
+        self.adaln = AdaLNZero(hidden_dim, cond_dim)
         self.attn = nn.MultiheadAttention(
             hidden_dim,
             n_heads,
             dropout=dropout,
             batch_first=True,
         )
-        self.adaln2 = AdaLN(hidden_dim, cond_dim)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * mlp_ratio),
             nn.GELU(),
@@ -56,12 +64,16 @@ class TransformerBlock(nn.Module):
         cond: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        h = self.adaln1(x, cond)
-        h, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
-        x = x + h
+        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.adaln.forward_params(cond)
 
-        h = self.adaln2(x, cond)
-        x = x + self.mlp(h)
+        # Attention with AdaLN-zero gating
+        h = self.adaln.norm1(x) * (1.0 + scale_a) + shift_a
+        h, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
+        x = x + gate_a * h
+
+        # MLP with AdaLN-zero gating
+        h = self.adaln.norm2(x) * (1.0 + scale_m) + shift_m
+        x = x + gate_m * self.mlp(h)
         return x
 
 
@@ -122,10 +134,10 @@ class TransformerPredictor(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        adaln_projs = {block.adaln1.proj for block in self.blocks}
-        adaln_projs.update(block.adaln2.proj for block in self.blocks)
+        # Exclude AdaLN-zero projections — those are zero-inited in AdaLNZero.__init__
+        adaln_proj_linears = {block.adaln.proj[-1] for block in self.blocks}
         for module in self.modules():
-            if isinstance(module, nn.Linear) and module not in adaln_projs:
+            if isinstance(module, nn.Linear) and module not in adaln_proj_linears:
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)

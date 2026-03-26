@@ -25,7 +25,7 @@ if REPO_ROOT not in sys.path:
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -47,7 +47,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--seq_len", type=int, default=4)
-    p.add_argument("--lr", type=float, default=2e-3)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--warmup_steps", type=int, default=1000,
+                    help="Number of linear LR warmup steps before cosine decay.")
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--save_every", type=int, default=1000)
@@ -84,7 +86,6 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
-    scaler: GradScaler,
     epoch: int,
     global_step: int,
 ) -> None:
@@ -93,7 +94,6 @@ def save_checkpoint(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
         },
@@ -191,14 +191,11 @@ def train(args: argparse.Namespace) -> None:
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = GradScaler("cuda")
 
     if args.resume_from and os.path.exists(args.resume_from):
         try:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            if "scaler_state_dict" in ckpt:
-                scaler.load_state_dict(ckpt["scaler_state_dict"])
             print(f"Restored optimiser state. Resuming at epoch {start_epoch}, step {global_step}.")
         except Exception as e:
             print(f"Warning: could not restore optimiser state: {e}")
@@ -254,13 +251,23 @@ def train(args: argparse.Namespace) -> None:
             sigreg_loss_val = out["sigreg_loss"].item()
             z_std = out["z_proj_std"].item()
 
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
+            # Warmup: linearly ramp LR from near-zero to args.lr over warmup_steps
+            if global_step < args.warmup_steps:
+                warmup_lr = args.lr * (global_step + 1) / args.warmup_steps
+                for pg in optimizer.param_groups:
+                    pg["lr"] = warmup_lr
+
+            total_loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=args.grad_clip,
             ).item()
-            scaler.step(optimizer)
-            scaler.update()
+
+            if not torch.isfinite(total_loss):
+                print(f"\n  WARNING: non-finite loss={total_loss.item():.4f} at step {global_step}, skipping update.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            optimizer.step()
 
             # NOTE: No EMA update — that's the whole point of LeWM.
 
@@ -270,7 +277,7 @@ def train(args: argparse.Namespace) -> None:
 
             # ---- Logging ---------------------------------------------
             global_step += 1
-            current_lr = scheduler.get_last_lr()[0]
+            current_lr = optimizer.param_groups[0]["lr"]
             loss_val = total_loss.item()
             epoch_loss_sum += loss_val
             epoch_batches += 1
@@ -301,7 +308,7 @@ def train(args: argparse.Namespace) -> None:
             # ---- Intra-epoch checkpoint ------------------------------
             if global_step % args.save_every == 0:
                 ckpt_path = os.path.join(args.out_dir, f"step_{global_step}.pt")
-                save_checkpoint(ckpt_path, model, optimizer, scheduler, scaler, epoch, global_step)
+                save_checkpoint(ckpt_path, model, optimizer, scheduler, epoch, global_step)
                 print(f"\n  Checkpoint saved: {ckpt_path}")
                 import glob as _glob
                 step_ckpts = sorted(_glob.glob(os.path.join(args.out_dir, "step_*.pt")))
@@ -320,7 +327,7 @@ def train(args: argparse.Namespace) -> None:
         )
 
         epoch_ckpt_path = os.path.join(args.out_dir, f"epoch_{epoch + 1}.pt")
-        save_checkpoint(epoch_ckpt_path, model, optimizer, scheduler, scaler, epoch, global_step)
+        save_checkpoint(epoch_ckpt_path, model, optimizer, scheduler, epoch, global_step)
         print(f"  Epoch checkpoint saved: {epoch_ckpt_path}")
 
     print("Training complete.")
