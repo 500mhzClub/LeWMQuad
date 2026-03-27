@@ -98,6 +98,7 @@ def load_frozen_encoder(args, device):
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
+    model = torch.compile(model)
     return model
 
 
