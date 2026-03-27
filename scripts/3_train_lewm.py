@@ -9,7 +9,6 @@ Replaces the EMA student-teacher JEPA training with the LeWM approach:
 
 Usage:
     python scripts/3_train_lewm.py --data_dir jepa_final_dataset_224 --batch_size 256 --sigreg_lambda 0.045
-
     python scripts/3_train_lewm.py --data_dir jepa_final_dataset_224 --batch_size 256 --sigreg_lambda 0.045
     --resume_from lewm_checkpoints/step_3000.pt
 """
