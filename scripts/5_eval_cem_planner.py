@@ -555,9 +555,8 @@ def main():
 
             # Current energy (for HUD)
             with torch.no_grad():
-                z_raw = world_model.encode_raw(vis_t, prop_for_planner)
-                _, z_proj = world_model.encode(vis_t.squeeze(0), prop_for_planner.squeeze(0) if prop_for_planner is not None else None)
-                cur_energy = float(energy_head(z_proj.unsqueeze(0)).item())
+                z_proj = world_model.encode_observation(vis_t, prop_for_planner)
+                cur_energy = float(energy_head(z_proj).item())
             energy_history.append(cur_energy)
 
             # Latency buffer
