@@ -75,7 +75,7 @@ class GreedyConfig:
     energy_weight: float = 1.0       # energy head cost
     beacon_weight: float = 0.5       # beacon proximity reward
     frontier_weight: float = 0.2     # frontier exploration reward
-    forward_bonus: float = 0.05      # mild reward for positive vx (tie-breaker only)
+    forward_bonus: float = 0.10      # adaptive: scales with energy spread
 
     # Contact escape parameters
     escape_reverse_steps: int = 8    # steps spent reversing
@@ -399,11 +399,16 @@ class GreedyEnergyPlanner:
         energy = self.eh.score_trajectory(z_pred_seq) / float(H)  # (N,)
         costs = self.cfg.energy_weight * energy
 
-        # Forward-motion bonus: reward positive vx to break ties in flat
-        # energy regions.  Without this the planner prefers spinning
-        # because nearby latents all score similarly.
+        # Adaptive forward bonus: scale by energy spread so it breaks
+        # ties in flat regions (corridors) without overriding real
+        # energy gradients (approaching a wall head-on).
         if self.cfg.forward_bonus > 0:
-            costs = costs - self.cfg.forward_bonus * self._actions[:, 0]
+            e_spread = energy.max() - energy.min()
+            # Bonus magnitude tracks the energy spread: strong enough to
+            # matter when energy is flat, proportionally weaker when the
+            # energy head has a clear opinion.
+            adaptive_scale = self.cfg.forward_bonus * (1.0 + e_spread)
+            costs = costs - adaptive_scale * self._actions[:, 0]
 
         # Beacon attraction: use terminal predicted latent
         z_terminal = z_pred_seq[:, -1, :]  # (N, D)
@@ -453,7 +458,8 @@ class GreedyEnergyPlanner:
             "cost_max": float(costs.max()),
             "energy_mean": float(energy.mean()),
             "energy_min": float(energy.min()),
-            "energy_spread": float(energy.max() - energy.min()),
+            "energy_spread": float(e_spread) if self.cfg.forward_bonus > 0 else float(energy.max() - energy.min()),
+            "fwd_scale": float(adaptive_scale) if self.cfg.forward_bonus > 0 else 0.0,
             "best_energy": float(energy[best_idx]),
             "beacon_bonus_max": float(beacon_bonus.max()) if active_targets else 0.0,
             "best_vx": float(best_action[0]),
@@ -479,9 +485,11 @@ class GreedyEnergyPlanner:
 
         z_pred_seq = self.wm.plan_rollout(z_start, action_seq)  # (K, H, D)
         energy = self.eh.score_trajectory(z_pred_seq) / float(H)
-        # Include forward bonus in refinement too
+        # Adaptive forward bonus (same logic as _score_actions)
         if self.cfg.forward_bonus > 0:
-            energy = energy - self.cfg.forward_bonus * candidates[:, 0]
+            e_spread = energy.max() - energy.min()
+            adaptive_scale = self.cfg.forward_bonus * (1.0 + e_spread)
+            energy = energy - adaptive_scale * candidates[:, 0]
         best_idx = energy.argmin()
         return candidates[best_idx]
 

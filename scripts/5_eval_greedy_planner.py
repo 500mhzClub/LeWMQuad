@@ -107,8 +107,8 @@ def parse_args():
     p.add_argument("--energy_weight", type=float, default=1.0)
     p.add_argument("--beacon_weight", type=float, default=0.5)
     p.add_argument("--frontier_weight", type=float, default=0.2)
-    p.add_argument("--forward_bonus", type=float, default=0.05,
-                   help="Mild reward for positive vx (tie-breaker only)")
+    p.add_argument("--forward_bonus", type=float, default=0.10,
+                   help="Adaptive forward bonus (scales with energy spread)")
     p.add_argument("--momentum", type=float, default=0.3,
                    help="Momentum to continue current action direction")
     p.add_argument("--refine_candidates", type=int, default=16)
@@ -815,9 +815,9 @@ def main():
                 if d:
                     print(f"    Greedy: cost={d.get('cost_min',0):.3f}/{d.get('cost_mean',0):.3f} "
                           f"energy={d.get('energy_min',0):.3f}/{d.get('energy_mean',0):.3f} "
-                          f"e_spread={d.get('energy_spread',0):.3f} "
+                          f"e_spread={d.get('energy_spread',0):.3f} fwd_s={d.get('fwd_scale',0):.3f} "
                           f"best_vx={d.get('best_vx',0):.2f} yaw={d.get('best_yaw',0):.2f} "
-                          f"beacon_bonus={d.get('beacon_bonus_max',0):.3f}")
+                          f"beacon={d.get('beacon_bonus_max',0):.3f}")
 
             # All beacons found
             if all(captured):
