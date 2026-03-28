@@ -63,8 +63,10 @@ class CEMConfig:
     stuck_threshold: float = 0.02
     stuck_patience: int = 8
     # Pose-based local stagnation detection
-    position_window: int = 60
-    position_radius: float = 0.35
+    position_window: int = 90
+    position_radius: float = 0.18
+    position_min_path: float = 0.10
+    position_min_displacement: float = 0.12
     # Recovery turn parameters
     turn_steps_min: int = 15
     turn_steps_max: int = 45
@@ -517,13 +519,25 @@ class CEMPlanner:
         return len(recent) >= 3 and sum(recent) >= 2
 
     def _position_stuck(self) -> bool:
-        """True if recent poses stay inside a small radius."""
+        """True if recent poses show little real spatial progress."""
         if len(self._position_window) < self._position_window.maxlen:
             return False
         pts = np.stack(self._position_window, axis=0)
+        step_deltas = np.diff(pts, axis=0)
+        path_length = float(np.linalg.norm(step_deltas, axis=1).sum())
+        displacement = float(np.linalg.norm(pts[-1] - pts[0]))
         center = pts.mean(axis=0, keepdims=True)
-        radius = np.linalg.norm(pts - center, axis=1).max()
-        return bool(radius < self.cfg.position_radius)
+        radius = float(np.linalg.norm(pts - center, axis=1).max())
+
+        # Case 1: almost no translation at all over the whole window.
+        no_motion = path_length < self.cfg.position_min_path
+
+        # Case 2: moving around locally but failing to leave a tiny pocket.
+        local_loop = (
+            radius < self.cfg.position_radius
+            and displacement < self.cfg.position_min_displacement
+        )
+        return no_motion or local_loop
 
     @property
     def coverage(self) -> Optional[LatentCoverageGrid]:

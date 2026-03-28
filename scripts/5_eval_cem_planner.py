@@ -107,8 +107,10 @@ def parse_args():
     p.add_argument("--coverage_motion_scale", type=float, default=0.20)
     p.add_argument("--collision_fwd_penalty", type=float, default=8.0)
     p.add_argument("--collision_yaw_bonus", type=float, default=4.0)
-    p.add_argument("--position_window", type=int, default=60)
-    p.add_argument("--position_radius", type=float, default=0.35)
+    p.add_argument("--position_window", type=int, default=90)
+    p.add_argument("--position_radius", type=float, default=0.18)
+    p.add_argument("--position_min_path", type=float, default=0.10)
+    p.add_argument("--position_min_displacement", type=float, default=0.12)
     p.add_argument("--coverage_dim", type=int, default=3)
     p.add_argument("--coverage_cells", type=int, default=8)
     # Model config
@@ -520,6 +522,8 @@ def main():
         collision_yaw_bonus=args.collision_yaw_bonus,
         position_window=args.position_window,
         position_radius=args.position_radius,
+        position_min_path=args.position_min_path,
+        position_min_displacement=args.position_min_displacement,
         coverage_dim=args.coverage_dim,
         coverage_cells=args.coverage_cells,
     )
