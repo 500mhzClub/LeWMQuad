@@ -81,9 +81,9 @@ class LatentCoverageGrid:
         self.n_cells = n_cells
         self.latent_dim = latent_dim
 
-        # Fixed random projection (orthogonal-ish via QR)
+        # Fixed random projection (orthogonal-ish via QR, built on CPU for reproducibility)
         rng = torch.Generator(device="cpu").manual_seed(seed)
-        W = torch.randn(latent_dim, proj_dim, generator=rng)
+        W = torch.randn(latent_dim, proj_dim, generator=rng, device="cpu")
         Q, _ = torch.linalg.qr(W)
         self.proj = Q.to(device)  # (latent_dim, proj_dim)
 
