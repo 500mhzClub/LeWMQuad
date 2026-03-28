@@ -102,15 +102,17 @@ def parse_args():
     p.add_argument("--no_video", action="store_true")
     p.add_argument("--out", type=str, default="eval_results/greedy_eval.mp4")
     # Explorer planner config
-    p.add_argument("--wander_hold_min", type=int, default=15)
-    p.add_argument("--wander_hold_max", type=int, default=30)
-    p.add_argument("--escape_reverse_steps", type=int, default=10)
-    p.add_argument("--escape_turn_steps_min", type=int, default=15)
-    p.add_argument("--escape_turn_steps_max", type=int, default=30)
-    p.add_argument("--homing_entry_threshold", type=float, default=8.0,
-                   help="L2 distance in latent space to enter beacon homing")
-    p.add_argument("--homing_patience", type=int, default=30)
-    p.add_argument("--homing_hold_steps", type=int, default=5)
+    p.add_argument("--hold_steps", type=int, default=5)
+    p.add_argument("--energy_weight", type=float, default=0.3)
+    p.add_argument("--forward_bonus", type=float, default=0.08)
+    p.add_argument("--beacon_weight", type=float, default=0.5)
+    p.add_argument("--collision_heading_weight", type=float, default=0.4)
+    p.add_argument("--action_hold_steps", type=int, default=5)
+    p.add_argument("--escape_reverse_steps", type=int, default=8)
+    p.add_argument("--escape_turn_steps_min", type=int, default=12)
+    p.add_argument("--escape_turn_steps_max", type=int, default=25)
+    p.add_argument("--homing_entry_threshold", type=float, default=8.0)
+    p.add_argument("--homing_patience", type=int, default=40)
     # Model config
     p.add_argument("--latent_dim", type=int, default=192)
     p.add_argument("--image_size", type=int, default=224)
@@ -550,14 +552,17 @@ def main():
     print(f"  Energy head: {args.energy_ckpt}")
 
     explorer_config = ExplorerConfig(
-        wander_hold_min=args.wander_hold_min,
-        wander_hold_max=args.wander_hold_max,
+        hold_steps=args.hold_steps,
+        energy_weight=args.energy_weight,
+        forward_bonus=args.forward_bonus,
+        beacon_weight=args.beacon_weight,
+        collision_heading_weight=args.collision_heading_weight,
+        action_hold_steps=args.action_hold_steps,
         escape_reverse_steps=args.escape_reverse_steps,
         escape_turn_steps_min=args.escape_turn_steps_min,
         escape_turn_steps_max=args.escape_turn_steps_max,
         homing_entry_threshold=args.homing_entry_threshold,
         homing_patience=args.homing_patience,
-        homing_hold_steps=args.homing_hold_steps,
     )
     planner = GreedyEnergyPlanner(
         world_model, energy_head, config=explorer_config, device=device,
@@ -807,11 +812,14 @@ def main():
                       f"frontier={fcells} | coverage={scov:.1f}% | "
                       f"escapes={planner.escape_events}")
                 if d:
-                    beacon_info = f"bcn_dist={d.get('beacon_dist',-1):.2f} target={d.get('beacon_target','none')}"
+                    line = (f"    e_spread={d.get('energy_spread',0):.3f} "
+                            f"best_vx={d.get('best_vx',0):.2f} yaw={d.get('best_yaw',0):.2f} "
+                            f"bcn_dist={d.get('beacon_dist',-1):.2f} "
+                            f"col_mem={d.get('n_collision_headings',0)}")
                     if planner.mode == "beacon_home":
-                        beacon_info += (f" homing_best={d.get('homing_pred_best',0):.2f}"
-                                        f" stale={d.get('homing_stale',0)}")
-                    print(f"    {beacon_info}  wander_rem={d.get('wander_remaining',0)}")
+                        line += (f" homing_best={d.get('homing_pred_best',0):.2f}"
+                                 f" stale={d.get('homing_stale',0)}")
+                    print(line)
 
             # All beacons found
             if all(captured):
