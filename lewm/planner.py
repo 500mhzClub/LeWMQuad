@@ -1,9 +1,10 @@
-"""CEM planner over latent energy landscape.
+"""CEM planner over latent energy landscape with latent coverage.
 
 Scores candidate action sequences by rolling them out through the
 world model predictor and summing per-step energy from the
-LatentEnergyHead.  Supports warm-starting (MPC) and optional
-goal-matching cost blending.
+LatentEnergyHead.  A latent coverage map (random-projection hash grid)
+rewards trajectories that visit novel regions of representation space,
+driving exploration without access to ground-truth position.
 
 Typical usage::
 
@@ -20,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,62 +43,127 @@ class CEMConfig:
     # Forward-motion bias for initial CEM mean (vx, vy, yaw_rate)
     forward_bias: Tuple[float, float, float] = (0.3, 0.0, 0.0)
     # Penalty weight for low forward velocity (encourages exploration)
-    stall_penalty: float = 0.5
-    # Latent novelty bonus (rewards visiting unseen latent regions)
-    novelty_weight: float = 0.3
-    memory_capacity: int = 200
+    stall_penalty: float = 2.0
+    # Latent coverage grid (random-projection hash)
+    coverage_weight: float = 1.0
+    coverage_dim: int = 8          # dimensionality of the hash projection
+    coverage_cells: int = 16       # bins per projected dimension
     # Momentum for warm-start blending (0 = pure warm-start, 1 = pure re-init)
     warmstart_decay: float = 0.0
     # Optional goal-matching weight (0 = energy-only)
     goal_weight: float = 0.0
 
 
-class LatentMemory:
-    """Fixed-size FIFO buffer of L2-normalized latents for novelty scoring.
+class LatentCoverageGrid:
+    """Hash-grid coverage map over latent space.
 
-    Stores recent observations so the planner can reward trajectories
-    that visit novel regions of latent space.  Similarity is cosine-based
-    (cheap dot products after pre-normalisation).
+    Projects high-dimensional latents through a fixed random matrix into
+    a low-dimensional space, then discretises into grid cells.  Each cell
+    tracks a visit count.  Trajectories passing through rarely-visited
+    cells get a novelty bonus.
+
+    This gives position-like discrimination without ground-truth coordinates:
+    the random projection amplifies small latent differences that cosine
+    similarity would miss, and the discretisation creates hard boundaries
+    that prevent "everything looks the same" collapse.
     """
 
-    def __init__(self, capacity: int, latent_dim: int, device: torch.device):
-        self.capacity = capacity
+    def __init__(
+        self,
+        latent_dim: int,
+        proj_dim: int = 8,
+        n_cells: int = 16,
+        device: torch.device = torch.device("cpu"),
+        seed: int = 42,
+    ):
         self.device = device
-        self.buffer = torch.empty(0, latent_dim, device=device)
+        self.proj_dim = proj_dim
+        self.n_cells = n_cells
+        self.latent_dim = latent_dim
 
-    def push(self, z: torch.Tensor):
-        """Append a latent observation.  z: (1, D) or (D,)."""
+        # Fixed random projection (orthogonal-ish via QR)
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        W = torch.randn(latent_dim, proj_dim, generator=rng)
+        Q, _ = torch.linalg.qr(W)
+        self.proj = Q.to(device)  # (latent_dim, proj_dim)
+
+        # We'll track min/max of projected values to auto-scale bins
+        self._proj_min = torch.full((proj_dim,), float("inf"), device=device)
+        self._proj_max = torch.full((proj_dim,), float("-inf"), device=device)
+
+        # Visit count table: flat hash -> count
+        # Use a dict for sparse storage (grid could be 16^8 = 4B cells)
+        self._counts: dict[int, int] = {}
+        self._total_visits = 0
+
+    def _project(self, z: torch.Tensor) -> torch.Tensor:
+        """Project latents to low-dim space. z: (..., D) -> (..., proj_dim)."""
+        return z.float() @ self.proj
+
+    def _to_cell_ids(self, p: torch.Tensor) -> torch.Tensor:
+        """Convert projected vectors to flat cell IDs. p: (..., proj_dim) -> (...,)."""
+        # Normalise each dimension to [0, 1] using running min/max
+        rng = (self._proj_max - self._proj_min).clamp(min=1e-6)
+        normed = (p - self._proj_min) / rng  # (..., proj_dim)
+        # Discretise to [0, n_cells-1]
+        bins = normed.clamp(0.0, 0.999).mul(self.n_cells).long()  # (..., proj_dim)
+        # Flat hash via mixed-radix encoding
+        multipliers = self.n_cells ** torch.arange(
+            self.proj_dim, device=self.device, dtype=torch.long
+        )
+        return (bins * multipliers).sum(dim=-1)  # (...,)
+
+    def mark(self, z: torch.Tensor):
+        """Record a visit for a single observation. z: (1, D) or (D,)."""
         if z.dim() == 1:
             z = z.unsqueeze(0)
-        z_norm = F.normalize(z.float(), dim=-1)
-        self.buffer = torch.cat([self.buffer, z_norm], dim=0)
-        if self.buffer.shape[0] > self.capacity:
-            self.buffer = self.buffer[-self.capacity :]
+        p = self._project(z)  # (1, proj_dim)
+        # Update running stats
+        self._proj_min = torch.min(self._proj_min, p.squeeze(0))
+        self._proj_max = torch.max(self._proj_max, p.squeeze(0))
 
-    def novelty(self, z_seq: torch.Tensor) -> torch.Tensor:
-        """Score how novel each candidate trajectory is w.r.t. the buffer.
+        cell_id = int(self._to_cell_ids(p).item())
+        self._counts[cell_id] = self._counts.get(cell_id, 0) + 1
+        self._total_visits += 1
+
+    def novelty_batch(self, z_seq: torch.Tensor) -> torch.Tensor:
+        """Score trajectory novelty by visit counts of predicted latent cells.
 
         Args:
-            z_seq: (N, H, D) — predicted latent trajectories from rollout.
+            z_seq: (N, H, D) -- predicted latent trajectories.
 
         Returns:
-            (N,) — summed novelty per candidate (higher = more novel).
+            (N,) -- summed novelty bonus.  Unvisited cells contribute 1.0,
+            frequently visited cells contribute 1/(1+count).
         """
-        if self.buffer.shape[0] == 0:
+        if self._total_visits == 0:
             return torch.zeros(z_seq.shape[0], device=self.device)
+
         N, H, D = z_seq.shape
-        z_flat = F.normalize(z_seq.reshape(N * H, D).float(), dim=-1)
-        # Cosine similarity to every memory entry
-        sim = z_flat @ self.buffer.T          # (N*H, M)
-        max_sim = sim.max(dim=-1).values      # (N*H,)
-        # novelty = 1 - nearest-neighbour similarity, summed over horizon
-        return (1.0 - max_sim).reshape(N, H).sum(dim=1)
+        p = self._project(z_seq.reshape(N * H, D))  # (N*H, proj_dim)
+        cell_ids = self._to_cell_ids(p)               # (N*H,)
+
+        # Look up counts
+        counts = torch.tensor(
+            [self._counts.get(int(c), 0) for c in cell_ids.cpu().tolist()],
+            device=self.device, dtype=torch.float32,
+        )
+        novelty = (1.0 / (1.0 + counts)).reshape(N, H).sum(dim=1)
+        return novelty
+
+    @property
+    def cells_visited(self) -> int:
+        return len(self._counts)
+
+    @property
+    def total_visits(self) -> int:
+        return self._total_visits
 
     def clear(self):
-        self.buffer = self.buffer[:0]
-
-    def __len__(self):
-        return self.buffer.shape[0]
+        self._counts.clear()
+        self._total_visits = 0
+        self._proj_min.fill_(float("inf"))
+        self._proj_max.fill_(float("-inf"))
 
 
 class CEMPlanner:
@@ -106,7 +173,7 @@ class CEMPlanner:
       1. Sample N action sequences from N(mean, std).
       2. Clamp to action bounds.
       3. Rollout through the world model predictor.
-      4. Score via energy head (+ optional goal cost).
+      4. Score via energy head + coverage bonus + stall penalty.
       5. Refit distribution from top-K elites.
       6. Repeat for ``n_iterations``.
 
@@ -134,12 +201,18 @@ class CEMPlanner:
         # Warm-start state
         self._prev_mean: Optional[torch.Tensor] = None
 
-        # Latent novelty memory
-        self._memory = LatentMemory(
-            capacity=self.cfg.memory_capacity,
-            latent_dim=0,   # will be set lazily on first push
-            device=self.device,
-        )
+        # Latent coverage grid (initialised lazily once latent_dim is known)
+        self._coverage: Optional[LatentCoverageGrid] = None
+
+    def _ensure_coverage(self, latent_dim: int):
+        """Lazily create the coverage grid once we know the latent dim."""
+        if self._coverage is None:
+            self._coverage = LatentCoverageGrid(
+                latent_dim=latent_dim,
+                proj_dim=self.cfg.coverage_dim,
+                n_cells=self.cfg.coverage_cells,
+                device=self.device,
+            )
 
     # ------------------------------------------------------------------ #
     # Core planning
@@ -154,27 +227,21 @@ class CEMPlanner:
         """Plan from an already-encoded latent.
 
         Args:
-            z_raw: (1, D) or (D,) — raw encoder embedding of current frame.
-            z_goal_proj: optional (1, D) or (D,) — projected goal embedding.
+            z_raw: (1, D) or (D,) -- raw encoder embedding of current frame.
+            z_goal_proj: optional (1, D) or (D,) -- projected goal embedding.
 
         Returns:
-            best_actions: (H, action_dim) — planned action sequence.
-            best_cost:    scalar — cost of the best trajectory.
+            best_actions: (H, action_dim) -- planned action sequence.
+            best_cost:    scalar -- cost of the best trajectory.
         """
         if z_raw.dim() == 1:
             z_raw = z_raw.unsqueeze(0)
         if z_goal_proj is not None and z_goal_proj.dim() == 1:
             z_goal_proj = z_goal_proj.unsqueeze(0)
 
-        # Push current observation into novelty memory
-        if self._memory.capacity > 0:
-            if self._memory.buffer.shape[0] == 0:
-                # Lazy init with correct latent dim
-                D_latent = z_raw.shape[-1]
-                self._memory = LatentMemory(
-                    self.cfg.memory_capacity, D_latent, self.device,
-                )
-            self._memory.push(z_raw)
+        # Mark current latent in coverage grid
+        self._ensure_coverage(z_raw.shape[-1])
+        self._coverage.mark(z_raw)
 
         H = self.cfg.horizon
         N = self.cfg.n_candidates
@@ -185,7 +252,6 @@ class CEMPlanner:
         if self._prev_mean is not None:
             # Shift forward by one step, repeat last action
             mean = torch.cat([self._prev_mean[1:], self._prev_mean[-1:]], dim=0)
-            # Blend toward zero based on decay
             if self.cfg.warmstart_decay > 0:
                 mean = mean * (1.0 - self.cfg.warmstart_decay)
         else:
@@ -201,21 +267,21 @@ class CEMPlanner:
             actions = mean.unsqueeze(0) + std.unsqueeze(0) * noise
             actions = actions.clamp(self._lo, self._hi)
 
-            # Rollout
+            # Rollout through world model
             z_pred = self.wm.plan_rollout(z_start, actions)  # (N, H, D_latent)
 
-            # Energy cost
+            # Energy cost (lower = safer)
             costs = self.eh.score_trajectory(z_pred)  # (N,)
 
-            # Forward-velocity bonus (encourages exploration)
+            # Forward-velocity bonus
             if self.cfg.stall_penalty > 0:
-                fwd_speed = actions[:, :, 0].mean(dim=1)  # avg vx over horizon
+                fwd_speed = actions[:, :, 0].mean(dim=1)
                 costs = costs - self.cfg.stall_penalty * fwd_speed
 
-            # Novelty bonus (reward visiting unseen latent regions)
-            if self.cfg.novelty_weight > 0 and len(self._memory) > 0:
-                novelty = self._memory.novelty(z_pred)    # (N,)
-                costs = costs - self.cfg.novelty_weight * novelty
+            # Latent coverage bonus
+            if self.cfg.coverage_weight > 0 and self._coverage.total_visits > 0:
+                cov_bonus = self._coverage.novelty_batch(z_pred)  # (N,)
+                costs = costs - self.cfg.coverage_weight * cov_bonus
 
             # Optional goal cost
             if z_goal_proj is not None and self.cfg.goal_weight > 0:
@@ -251,7 +317,7 @@ class CEMPlanner:
         """Encode current (and optional goal) observation, then plan.
 
         Args:
-            vis: (1, C, H, W) or (C, H, W) — current frame (float, [0,1]).
+            vis: (1, C, H, W) or (C, H, W) -- current frame (float, [0,1]).
             proprio: (1, P) or (P,) or None.
             goal_vis: optional goal frame.
             goal_proprio: optional goal proprioception.
@@ -287,12 +353,18 @@ class CEMPlanner:
         """Plan and return only the first action (for MPC loop).
 
         Returns:
-            (action_dim,) — action to execute this timestep.
+            (action_dim,) -- action to execute this timestep.
         """
         action_seq, _ = self.plan_from_obs(vis, proprio, goal_vis, goal_proprio)
         return action_seq[0]
 
+    @property
+    def coverage(self) -> Optional[LatentCoverageGrid]:
+        """Access the coverage grid (for HUD rendering / metrics)."""
+        return self._coverage
+
     def reset(self):
-        """Clear warm-start state and novelty memory (call between episodes)."""
+        """Clear warm-start state and coverage grid (call between episodes)."""
         self._prev_mean = None
-        self._memory.clear()
+        if self._coverage is not None:
+            self._coverage.clear()

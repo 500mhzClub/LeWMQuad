@@ -100,10 +100,11 @@ def parse_args():
     p.add_argument("--n_candidates", type=int, default=128)
     p.add_argument("--n_elites", type=int, default=16)
     p.add_argument("--n_iterations", type=int, default=3)
-    p.add_argument("--stall_penalty", type=float, default=0.5)
+    p.add_argument("--stall_penalty", type=float, default=2.0)
     p.add_argument("--forward_bias", type=float, default=0.3)
-    p.add_argument("--novelty_weight", type=float, default=0.3)
-    p.add_argument("--memory_capacity", type=int, default=200)
+    p.add_argument("--coverage_weight", type=float, default=1.0)
+    p.add_argument("--coverage_dim", type=int, default=8)
+    p.add_argument("--coverage_cells", type=int, default=16)
     # Model config
     p.add_argument("--latent_dim", type=int, default=192)
     p.add_argument("--image_size", type=int, default=224)
@@ -255,11 +256,63 @@ def _wp_to_map(xy, mx, my, mw, mh):
     return (mx + int(np.clip(nx, 0, 1) * mw), my + mh - int(np.clip(ny, 0, 1) * mh))
 
 
-def draw_minimap(draw, robot_xy, robot_yaw, trail, plan_path,
-                 beacon_layout, captured,
+class SpatialCoverageGrid:
+    """Ground-truth spatial coverage grid (diagnostic only, robot does NOT see this)."""
+
+    def __init__(self, world_min, world_max, cell_size=0.25):
+        self.world_min = np.array(world_min, dtype=np.float32)
+        self.world_max = np.array(world_max, dtype=np.float32)
+        self.cell_size = cell_size
+        extent = self.world_max - self.world_min
+        self.nx = max(1, int(extent[0] / cell_size))
+        self.ny = max(1, int(extent[1] / cell_size))
+        self.counts = np.zeros((self.nx, self.ny), dtype=np.int32)
+
+    def mark(self, x: float, y: float):
+        ix = int((x - self.world_min[0]) / self.cell_size)
+        iy = int((y - self.world_min[1]) / self.cell_size)
+        ix = max(0, min(ix, self.nx - 1))
+        iy = max(0, min(iy, self.ny - 1))
+        self.counts[ix, iy] += 1
+
+    @property
+    def cells_visited(self) -> int:
+        return int((self.counts > 0).sum())
+
+    @property
+    def coverage_frac(self) -> float:
+        return self.cells_visited / max(1, self.nx * self.ny)
+
+    def to_heatmap(self, width: int, height: int) -> np.ndarray:
+        """Render as (H, W, 3) uint8 heatmap image."""
+        log_counts = np.log1p(self.counts.T[::-1].astype(np.float32))
+        mx = log_counts.max()
+        if mx > 0:
+            normed = log_counts / mx
+        else:
+            normed = log_counts
+        # Green channel for visited areas
+        r = (normed * 40).astype(np.uint8)
+        g = (normed * 200).astype(np.uint8)
+        b = (normed * 60).astype(np.uint8)
+        img = np.stack([r, g, b], axis=-1)
+        return np.array(Image.fromarray(img).resize((width, height), Image.NEAREST))
+
+
+def draw_minimap(draw, canvas, robot_xy, robot_yaw, trail, plan_path,
+                 beacon_layout, captured, spatial_cov=None,
                  mx=514, my=494, mw=372, mh=155):
-    """Draw minimap with trail, planned path, beacon markers, and robot."""
+    """Draw minimap with coverage heatmap, trail, beacon markers, and robot."""
     draw.rectangle([mx, my, mx + mw, my + mh], fill=(18, 18, 18), outline=(95, 95, 95))
+
+    # Coverage heatmap overlay (diagnostic — from ground-truth positions)
+    if spatial_cov is not None and spatial_cov.cells_visited > 0:
+        heatmap = spatial_cov.to_heatmap(mw, mh)
+        hm_img = Image.fromarray(heatmap)
+        # Blend onto canvas at minimap position
+        bg = canvas.crop((mx, my, mx + mw, my + mh))
+        blended = Image.blend(bg, hm_img, alpha=0.6)
+        canvas.paste(blended, (mx, my))
 
     # Trail (yellow)
     if len(trail) > 1:
@@ -310,6 +363,7 @@ def compose_frame(
     energy_val: float,
     energy_history: list,
     event_log: list,
+    spatial_cov=None,
 ) -> np.ndarray:
     """Compose 896×660 HUD frame matching TinyQuadJEPA-v2 layout."""
     # Layout:
@@ -380,9 +434,9 @@ def compose_frame(
         if len(pts) > 1:
             draw.line(pts, fill=(0, 200, 255), width=1)
 
-    # Minimap
-    draw_minimap(draw, robot_xy, robot_yaw, trail, plan_path,
-                 beacon_layout, captured)
+    # Minimap with coverage overlay
+    draw_minimap(draw, canvas, robot_xy, robot_yaw, trail, plan_path,
+                 beacon_layout, captured, spatial_cov=spatial_cov)
 
     # ── Event log (below overhead view) ─────────────────────── #
     draw.rectangle([0, 568, 511, 659], fill=(14, 14, 14), outline=(55, 55, 55))
@@ -448,8 +502,9 @@ def main():
         n_iterations=args.n_iterations,
         forward_bias=(args.forward_bias, 0.0, 0.0),
         stall_penalty=args.stall_penalty,
-        novelty_weight=args.novelty_weight,
-        memory_capacity=args.memory_capacity,
+        coverage_weight=args.coverage_weight,
+        coverage_dim=args.coverage_dim,
+        coverage_cells=args.coverage_cells,
     )
     planner = CEMPlanner(world_model, energy_head, config=cem_config, device=device)
 
@@ -530,6 +585,9 @@ def main():
         energy_history: List[float] = []
         event_log: List[Tuple[str, str]] = []
 
+        # Ground-truth spatial coverage (diagnostic only — robot doesn't see it)
+        spatial_cov = SpatialCoverageGrid(WORLD_MIN, WORLD_MAX, cell_size=0.25)
+
         writer = None
         if not args.no_video:
             vid_path = args.out.replace(".mp4", f"_ep{ep:03d}.mp4")
@@ -542,6 +600,7 @@ def main():
             robot_pos_3d, robot_yaw = move_cams(robot, cam_brain, cam_eye, cam_over)
             robot_xy = robot_pos_3d[:2].astype(np.float32)
             trail.append(robot_xy.copy())
+            spatial_cov.mark(float(robot_xy[0]), float(robot_xy[1]))
 
             # Render brain camera for JEPA encoder
             brain_rgb = render_rgb(cam_brain)
@@ -620,13 +679,15 @@ def main():
                 over_rgb = render_rgb(cam_over)
                 eye_rgb = render_rgb(cam_eye)
 
+                cov = planner.coverage
+                cov_cells = cov.cells_visited if cov else 0
                 status_lines = [
                     f"step: {step}/{args.max_steps}",
                     f"pos: ({robot_xy[0]:.2f}, {robot_xy[1]:.2f})  yaw: {math.degrees(robot_yaw):.0f}deg",
                     f"cmd: ({float(cmd[0]):.2f}, {float(cmd[1]):.2f}, {float(cmd[2]):.2f})",
                     f"collisions: {total_collisions}",
                     f"beacons: {sum(captured)}/{n_beacons}",
-                    f"memory: {len(planner._memory)}/{args.memory_capacity}",
+                    f"latent cells: {cov_cells}",
                 ]
 
                 frame = compose_frame(
@@ -634,14 +695,18 @@ def main():
                     robot_xy, robot_yaw, trail, None,
                     beacon_layout, captured,
                     status_lines, cur_energy, energy_history,
-                    event_log,
+                    event_log, spatial_cov=spatial_cov,
                 )
                 writer.append_data(frame)
 
             # Progress
             if step % 100 == 0:
+                cov = planner.coverage
+                lcells = cov.cells_visited if cov else 0
+                scov = spatial_cov.coverage_frac * 100
                 print(f"  step {step:4d} | energy={cur_energy:.3f} | "
-                      f"beacons={sum(captured)}/{n_beacons} | collisions={total_collisions}")
+                      f"beacons={sum(captured)}/{n_beacons} | col={total_collisions} | "
+                      f"lcells={lcells} | coverage={scov:.1f}%")
 
             # All beacons found
             if all(captured):
@@ -658,12 +723,18 @@ def main():
         trajectory = np.array(trail)
         path_length = float(np.sum(np.linalg.norm(np.diff(trajectory, axis=0), axis=1))) if len(trail) > 1 else 0.0
 
+        cov = planner.coverage
+        lcells = cov.cells_visited if cov else 0
+        scov_pct = spatial_cov.coverage_frac * 100
+        scov_cells = spatial_cov.cells_visited
         print(f"\n  Results:")
-        print(f"    Steps:      {n_steps}/{args.max_steps}")
-        print(f"    Beacons:    {sum(captured)}/{n_beacons}")
-        print(f"    Collisions: {total_collisions}")
-        print(f"    Path len:   {path_length:.2f} m")
-        print(f"    Time:       {elapsed:.1f}s ({n_steps / elapsed:.1f} steps/s)")
+        print(f"    Steps:          {n_steps}/{args.max_steps}")
+        print(f"    Beacons:        {sum(captured)}/{n_beacons}")
+        print(f"    Collisions:     {total_collisions}")
+        print(f"    Path len:       {path_length:.2f} m")
+        print(f"    Latent cells:   {lcells}")
+        print(f"    Spatial cells:  {scov_cells}/{spatial_cov.nx * spatial_cov.ny} ({scov_pct:.1f}%)")
+        print(f"    Time:           {elapsed:.1f}s ({n_steps / elapsed:.1f} steps/s)")
 
         traj_path = os.path.join(os.path.dirname(args.out), f"trajectory_ep{ep:03d}.npy")
         np.save(traj_path, trajectory)
@@ -672,7 +743,10 @@ def main():
             "episode": ep, "seed": ep_seed, "maze_style": maze_style,
             "steps": n_steps, "beacons_captured": sum(captured),
             "beacons_total": n_beacons, "collisions": total_collisions,
-            "path_length": path_length, "elapsed": elapsed,
+            "path_length": path_length, "latent_cells": lcells,
+            "spatial_coverage_pct": round(scov_pct, 1),
+            "spatial_cells": scov_cells,
+            "elapsed": elapsed,
         })
 
         scene.destroy()
@@ -687,10 +761,12 @@ def main():
     avg_path = np.mean([r["path_length"] for r in all_results])
     avg_steps = np.mean([r["steps"] for r in all_results])
 
+    avg_scov = np.mean([r["spatial_coverage_pct"] for r in all_results])
     print(f"  Episodes:     {args.n_episodes}")
     print(f"  Beacons:      {total_cap}/{total_pos} ({100 * total_cap / max(1, total_pos):.0f}%)")
     print(f"  Collisions:   {total_col} total ({total_col / args.n_episodes:.1f}/ep)")
     print(f"  Avg path:     {avg_path:.2f} m")
+    print(f"  Avg coverage: {avg_scov:.1f}%")
     print(f"  Avg steps:    {avg_steps:.0f}")
 
     summary_path = os.path.join(os.path.dirname(args.out), "eval_summary.json")
