@@ -75,7 +75,7 @@ class GreedyConfig:
     energy_weight: float = 1.0       # energy head cost
     beacon_weight: float = 0.5       # beacon proximity reward
     frontier_weight: float = 0.2     # frontier exploration reward
-    forward_bonus: float = 0.4       # reward positive vx to break energy ties
+    forward_bonus: float = 0.05      # mild reward for positive vx (tie-breaker only)
 
     # Contact escape parameters
     escape_reverse_steps: int = 8    # steps spent reversing
@@ -89,7 +89,7 @@ class GreedyConfig:
     escape_extend_steps: int = 5
 
     # Post-escape grace period (continue in free mode without re-triggering)
-    post_escape_grace: int = 8
+    post_escape_grace: int = 20
 
     # CEM refinement around best primitive (0 = disabled)
     refine_candidates: int = 16
@@ -100,8 +100,9 @@ class GreedyConfig:
     frontier_world_min: Tuple[float, float] = (-3.5, -3.5)
     frontier_world_max: Tuple[float, float] = (3.5, 3.5)
 
-    # Simple momentum: blend previous action into scoring
-    momentum: float = 0.0  # 0 = no momentum
+    # Momentum: slightly prefer continuing current action direction.
+    # Prevents oscillation (especially post-escape whiplash).
+    momentum: float = 0.3
 
 
 # ---------------------------------------------------------------------- #

@@ -96,8 +96,8 @@ def parse_args():
     p.add_argument("--energy_ckpt", type=str, required=True)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--sim_backend", type=str, default="auto")
-    p.add_argument("--max_steps", type=int, default=2000)
-    p.add_argument("--n_episodes", type=int, default=5)
+    p.add_argument("--max_steps", type=int, default=5000)
+    p.add_argument("--n_episodes", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no_video", action="store_true")
     p.add_argument("--out", type=str, default="eval_results/greedy_eval.mp4")
@@ -107,8 +107,10 @@ def parse_args():
     p.add_argument("--energy_weight", type=float, default=1.0)
     p.add_argument("--beacon_weight", type=float, default=0.5)
     p.add_argument("--frontier_weight", type=float, default=0.2)
-    p.add_argument("--forward_bonus", type=float, default=0.4,
-                   help="Reward for positive vx to break energy ties")
+    p.add_argument("--forward_bonus", type=float, default=0.05,
+                   help="Mild reward for positive vx (tie-breaker only)")
+    p.add_argument("--momentum", type=float, default=0.3,
+                   help="Momentum to continue current action direction")
     p.add_argument("--refine_candidates", type=int, default=16)
     p.add_argument("--escape_reverse_steps", type=int, default=8)
     p.add_argument("--escape_turn_steps_min", type=int, default=10)
@@ -557,6 +559,7 @@ def main():
         beacon_weight=args.beacon_weight,
         frontier_weight=args.frontier_weight,
         forward_bonus=args.forward_bonus,
+        momentum=args.momentum,
         refine_candidates=args.refine_candidates,
         escape_reverse_steps=args.escape_reverse_steps,
         escape_turn_steps_min=args.escape_turn_steps_min,
