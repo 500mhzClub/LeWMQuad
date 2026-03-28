@@ -1,10 +1,10 @@
-"""CEM planner over latent energy landscape with latent coverage.
+"""CEM planner over latent energy landscape with exploration.
 
 Scores candidate action sequences by rolling them out through the
 world model predictor and summing per-step energy from the
-LatentEnergyHead.  A latent coverage map (random-projection hash grid)
-rewards trajectories that visit novel regions of representation space,
-driving exploration without access to ground-truth position.
+LatentEnergyHead.  A latent coverage grid rewards trajectories that
+visit novel regions of representation space, and a stuck detector
+forces random recovery turns when the robot's observations stop changing.
 
 Typical usage::
 
@@ -18,7 +18,9 @@ Typical usage::
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import random as pyrandom
+from collections import deque
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
@@ -42,37 +44,40 @@ class CEMConfig:
     min_std: float = 0.01
     # Forward-motion bias for initial CEM mean (vx, vy, yaw_rate)
     forward_bias: Tuple[float, float, float] = (0.3, 0.0, 0.0)
-    # Penalty weight for low forward velocity (encourages exploration)
-    stall_penalty: float = 2.0
+    # Cost component weights
+    energy_weight: float = 0.3     # down-weighted so it doesn't dominate
+    stall_penalty: float = 2.0     # strong forward drive
+    coverage_weight: float = 2.0   # strong novelty drive
     # Latent coverage grid (random-projection hash)
-    coverage_weight: float = 2.0
-    coverage_dim: int = 3          # dimensionality of the hash projection
-    coverage_cells: int = 8        # bins per projected dimension (8^3 = 512 cells)
-    # Momentum for warm-start blending (0 = pure warm-start, 1 = pure re-init)
+    coverage_dim: int = 3
+    coverage_cells: int = 8        # 8^3 = 512 cells
+    # Stuck detection
+    stuck_window: int = 25
+    stuck_threshold: float = 0.02
+    stuck_patience: int = 8
+    # Recovery turn parameters
+    turn_steps_min: int = 15
+    turn_steps_max: int = 45
+    turn_yaw_min: float = 0.8
+    turn_yaw_max: float = 1.4
+    # Momentum for warm-start
     warmstart_decay: float = 0.0
-    # Optional goal-matching weight (0 = energy-only)
+    # Optional goal-matching weight
     goal_weight: float = 0.0
 
 
+# ---------------------------------------------------------------------- #
+# Latent coverage grid
+# ---------------------------------------------------------------------- #
+
 class LatentCoverageGrid:
-    """Hash-grid coverage map over latent space.
-
-    Projects high-dimensional latents through a fixed random matrix into
-    a low-dimensional space, then discretises into grid cells.  Each cell
-    tracks a visit count.  Trajectories passing through rarely-visited
-    cells get a novelty bonus.
-
-    This gives position-like discrimination without ground-truth coordinates:
-    the random projection amplifies small latent differences that cosine
-    similarity would miss, and the discretisation creates hard boundaries
-    that prevent "everything looks the same" collapse.
-    """
+    """Hash-grid coverage map over latent space."""
 
     def __init__(
         self,
         latent_dim: int,
-        proj_dim: int = 8,
-        n_cells: int = 16,
+        proj_dim: int = 3,
+        n_cells: int = 8,
         device: torch.device = torch.device("cpu"),
         seed: int = 42,
     ):
@@ -81,75 +86,49 @@ class LatentCoverageGrid:
         self.n_cells = n_cells
         self.latent_dim = latent_dim
 
-        # Fixed random projection (orthogonal-ish via QR, built on CPU for reproducibility)
         rng = torch.Generator(device="cpu").manual_seed(seed)
         W = torch.randn(latent_dim, proj_dim, generator=rng, device="cpu")
         Q, _ = torch.linalg.qr(W)
-        self.proj = Q.to(device)  # (latent_dim, proj_dim)
+        self.proj = Q.to(device)
 
-        # We'll track min/max of projected values to auto-scale bins
         self._proj_min = torch.full((proj_dim,), float("inf"), device=device)
         self._proj_max = torch.full((proj_dim,), float("-inf"), device=device)
-
-        # Visit count table: flat hash -> count
-        # Use a dict for sparse storage (grid could be 16^8 = 4B cells)
         self._counts: dict[int, int] = {}
         self._total_visits = 0
 
     def _project(self, z: torch.Tensor) -> torch.Tensor:
-        """Project latents to low-dim space. z: (..., D) -> (..., proj_dim)."""
         return z.float() @ self.proj
 
     def _to_cell_ids(self, p: torch.Tensor) -> torch.Tensor:
-        """Convert projected vectors to flat cell IDs. p: (..., proj_dim) -> (...,)."""
-        # Normalise each dimension to [0, 1] using running min/max
         rng = (self._proj_max - self._proj_min).clamp(min=1e-6)
-        normed = (p - self._proj_min) / rng  # (..., proj_dim)
-        # Discretise to [0, n_cells-1]
-        bins = normed.clamp(0.0, 0.999).mul(self.n_cells).long()  # (..., proj_dim)
-        # Flat hash via mixed-radix encoding
+        normed = (p - self._proj_min) / rng
+        bins = normed.clamp(0.0, 0.999).mul(self.n_cells).long()
         multipliers = self.n_cells ** torch.arange(
             self.proj_dim, device=self.device, dtype=torch.long
         )
-        return (bins * multipliers).sum(dim=-1)  # (...,)
+        return (bins * multipliers).sum(dim=-1)
 
     def mark(self, z: torch.Tensor):
-        """Record a visit for a single observation. z: (1, D) or (D,)."""
         if z.dim() == 1:
             z = z.unsqueeze(0)
-        p = self._project(z)  # (1, proj_dim)
-        # Update running stats
+        p = self._project(z)
         self._proj_min = torch.min(self._proj_min, p.squeeze(0))
         self._proj_max = torch.max(self._proj_max, p.squeeze(0))
-
         cell_id = int(self._to_cell_ids(p).item())
         self._counts[cell_id] = self._counts.get(cell_id, 0) + 1
         self._total_visits += 1
 
     def novelty_batch(self, z_seq: torch.Tensor) -> torch.Tensor:
-        """Score trajectory novelty by visit counts of predicted latent cells.
-
-        Args:
-            z_seq: (N, H, D) -- predicted latent trajectories.
-
-        Returns:
-            (N,) -- summed novelty bonus.  Unvisited cells contribute 1.0,
-            frequently visited cells contribute 1/(1+count).
-        """
         if self._total_visits == 0:
             return torch.zeros(z_seq.shape[0], device=self.device)
-
         N, H, D = z_seq.shape
-        p = self._project(z_seq.reshape(N * H, D))  # (N*H, proj_dim)
-        cell_ids = self._to_cell_ids(p)               # (N*H,)
-
-        # Look up counts
+        p = self._project(z_seq.reshape(N * H, D))
+        cell_ids = self._to_cell_ids(p)
         counts = torch.tensor(
             [self._counts.get(int(c), 0) for c in cell_ids.cpu().tolist()],
             device=self.device, dtype=torch.float32,
         )
-        novelty = (1.0 / (1.0 + counts)).reshape(N, H).sum(dim=1)
-        return novelty
+        return (1.0 / (1.0 + counts)).reshape(N, H).sum(dim=1)
 
     @property
     def cells_visited(self) -> int:
@@ -166,19 +145,60 @@ class LatentCoverageGrid:
         self._proj_max.fill_(float("-inf"))
 
 
+# ---------------------------------------------------------------------- #
+# Stuck detector
+# ---------------------------------------------------------------------- #
+
+class StuckDetector:
+    """Detects when the robot is stuck by monitoring latent observation velocity."""
+
+    def __init__(self, window: int = 25, threshold: float = 0.02, patience: int = 8):
+        self.window = window
+        self.threshold = threshold
+        self.patience = patience
+        self._latents: deque = deque(maxlen=window)
+        self._stuck_count: int = 0
+        self.total_stuck_events: int = 0
+
+    def update(self, z: torch.Tensor) -> bool:
+        self._latents.append(z.detach().float().cpu().squeeze())
+        if len(self._latents) < self.window:
+            return False
+        z_stack = torch.stack(list(self._latents))
+        avg_delta = (z_stack[1:] - z_stack[:-1]).norm(dim=-1).mean().item()
+        if avg_delta < self.threshold:
+            self._stuck_count += 1
+        else:
+            self._stuck_count = 0
+        triggered = self._stuck_count >= self.patience
+        if triggered:
+            self.total_stuck_events += 1
+            self._stuck_count = 0
+        return triggered
+
+    def reset(self):
+        self._latents.clear()
+        self._stuck_count = 0
+        self.total_stuck_events = 0
+
+
+# ---------------------------------------------------------------------- #
+# CEM Planner
+# ---------------------------------------------------------------------- #
+
 class CEMPlanner:
-    """Cross-Entropy Method planner over the latent energy landscape.
+    """CEM planner with JEPA rollouts, latent coverage, and stuck recovery.
 
-    Each planning call:
+    Normal operation:
       1. Sample N action sequences from N(mean, std).
-      2. Clamp to action bounds.
-      3. Rollout through the world model predictor.
-      4. Score via energy head + coverage bonus + stall penalty.
-      5. Refit distribution from top-K elites.
-      6. Repeat for ``n_iterations``.
+      2. Rollout through the world model predictor.
+      3. Score: energy_weight * energy - stall_penalty * fwd_speed
+                - coverage_weight * novelty
+      4. Refit from elites. Repeat.
 
-    Warm-starting: the previous solution is time-shifted by one step and
-    used as the initial mean for the next call, reducing re-planning cost.
+    When the stuck detector fires (latent observations stopped changing):
+      Execute a random recovery turn for 15-45 steps, bypassing CEM.
+      This breaks out of dead ends where all CEM candidates look the same.
     """
 
     def __init__(
@@ -193,19 +213,30 @@ class CEMPlanner:
         self.cfg = config or CEMConfig()
         self.device = torch.device(device)
 
-        # Pre-compute bound tensors
         self._lo = torch.tensor(self.cfg.action_low, device=self.device)
         self._hi = torch.tensor(self.cfg.action_high, device=self.device)
         self._fwd_bias = torch.tensor(self.cfg.forward_bias, device=self.device)
 
-        # Warm-start state
+        # Warm-start
         self._prev_mean: Optional[torch.Tensor] = None
 
-        # Latent coverage grid (initialised lazily once latent_dim is known)
+        # Coverage grid (lazy init)
         self._coverage: Optional[LatentCoverageGrid] = None
 
+        # Stuck detection + recovery turn state
+        self._stuck = StuckDetector(
+            window=self.cfg.stuck_window,
+            threshold=self.cfg.stuck_threshold,
+            patience=self.cfg.stuck_patience,
+        )
+        self._is_stuck: bool = False
+        self._turn_remaining: int = 0
+        self._turn_yaw: float = 0.0
+
+        # Diagnostics from last CEM iteration
+        self.diag: dict = {}
+
     def _ensure_coverage(self, latent_dim: int):
-        """Lazily create the coverage grid once we know the latent dim."""
         if self._coverage is None:
             self._coverage = LatentCoverageGrid(
                 latent_dim=latent_dim,
@@ -215,7 +246,7 @@ class CEMPlanner:
             )
 
     # ------------------------------------------------------------------ #
-    # Core planning
+    # Core CEM planning
     # ------------------------------------------------------------------ #
 
     @torch.no_grad()
@@ -224,22 +255,12 @@ class CEMPlanner:
         z_raw: torch.Tensor,
         z_goal_proj: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Plan from an already-encoded latent.
-
-        Args:
-            z_raw: (1, D) or (D,) -- raw encoder embedding of current frame.
-            z_goal_proj: optional (1, D) or (D,) -- projected goal embedding.
-
-        Returns:
-            best_actions: (H, action_dim) -- planned action sequence.
-            best_cost:    scalar -- cost of the best trajectory.
-        """
+        """CEM planning from an encoded latent using JEPA rollouts."""
         if z_raw.dim() == 1:
             z_raw = z_raw.unsqueeze(0)
         if z_goal_proj is not None and z_goal_proj.dim() == 1:
             z_goal_proj = z_goal_proj.unsqueeze(0)
 
-        # Mark current latent in coverage grid
         self._ensure_coverage(z_raw.shape[-1])
         self._coverage.mark(z_raw)
 
@@ -250,7 +271,6 @@ class CEMPlanner:
 
         # Initialise distribution
         if self._prev_mean is not None:
-            # Shift forward by one step, repeat last action
             mean = torch.cat([self._prev_mean[1:], self._prev_mean[-1:]], dim=0)
             if self.cfg.warmstart_decay > 0:
                 mean = mean * (1.0 - self.cfg.warmstart_decay)
@@ -258,74 +278,68 @@ class CEMPlanner:
             mean = self._fwd_bias.unsqueeze(0).expand(H, -1).clone()
         std = torch.full((H, D), self.cfg.init_std, device=self.device)
 
-        # Expand z_start for all candidates: (1, D) -> (N, D)
         z_start = z_raw.expand(N, -1)
 
         for _it in range(self.cfg.n_iterations):
-            # Sample
             noise = torch.randn(N, H, D, device=self.device)
-            actions = mean.unsqueeze(0) + std.unsqueeze(0) * noise
-            actions = actions.clamp(self._lo, self._hi)
+            actions = (mean.unsqueeze(0) + std.unsqueeze(0) * noise).clamp(
+                self._lo, self._hi,
+            )
 
-            # Rollout through world model
-            z_pred = self.wm.plan_rollout(z_start, actions)  # (N, H, D_latent)
+            # JEPA rollout
+            z_pred = self.wm.plan_rollout(z_start, actions)
 
-            # Energy cost (lower = safer)
-            costs = self.eh.score_trajectory(z_pred)  # (N,)
+            # Weighted energy cost (down-weighted so it doesn't dominate)
+            costs = self.cfg.energy_weight * self.eh.score_trajectory(z_pred)
 
             # Forward-velocity bonus
             if self.cfg.stall_penalty > 0:
-                fwd_speed = actions[:, :, 0].mean(dim=1)
-                costs = costs - self.cfg.stall_penalty * fwd_speed
+                costs = costs - self.cfg.stall_penalty * actions[:, :, 0].mean(dim=1)
 
             # Latent coverage bonus
             if self.cfg.coverage_weight > 0 and self._coverage.total_visits > 0:
-                cov_bonus = self._coverage.novelty_batch(z_pred)  # (N,)
-                costs = costs - self.cfg.coverage_weight * cov_bonus
+                costs = costs - self.cfg.coverage_weight * self._coverage.novelty_batch(z_pred)
 
-            # Optional goal cost
+            # Goal cost
             if z_goal_proj is not None and self.cfg.goal_weight > 0:
                 goal_cost = self.wm.plan_cost(z_pred, z_goal_proj.expand(N, -1))
                 costs = costs + self.cfg.goal_weight * goal_cost
 
-            # Select elites
             elite_idx = costs.topk(K, largest=False).indices
-            elite_actions = actions[elite_idx]  # (K, H, D)
-
-            # Refit
+            elite_actions = actions[elite_idx]
             mean = elite_actions.mean(dim=0)
             std = elite_actions.std(dim=0).clamp(min=self.cfg.min_std)
 
-        # Cache for warm-start
         self._prev_mean = mean.clone()
 
-        best_cost = costs[elite_idx[0]]
-        return mean, best_cost
+        # Capture diagnostics for debugging
+        self.diag = {
+            "cost_mean": float(costs.mean()),
+            "cost_std": float(costs.std()),
+            "cost_min": float(costs.min()),
+            "cost_max": float(costs.max()),
+            "energy_mean": float(self.eh.score_trajectory(z_pred).mean()),
+            "energy_std": float(self.eh.score_trajectory(z_pred).std()),
+            "z_pred_std": float(z_pred.std()),
+            "elite_vx": float(elite_actions[:, :, 0].mean()),
+            "elite_yaw": float(elite_actions[:, :, 2].mean()),
+        }
+
+        return mean, costs[elite_idx[0]]
 
     # ------------------------------------------------------------------ #
-    # Convenience: encode + plan in one call
+    # Step: CEM + stuck recovery
     # ------------------------------------------------------------------ #
 
     @torch.no_grad()
-    def plan_from_obs(
+    def step(
         self,
         vis: torch.Tensor,
         proprio: torch.Tensor | None,
         goal_vis: Optional[torch.Tensor] = None,
         goal_proprio: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode current (and optional goal) observation, then plan.
-
-        Args:
-            vis: (1, C, H, W) or (C, H, W) -- current frame (float, [0,1]).
-            proprio: (1, P) or (P,) or None.
-            goal_vis: optional goal frame.
-            goal_proprio: optional goal proprioception.
-
-        Returns:
-            best_actions: (H, action_dim)
-            best_cost: scalar
-        """
+    ) -> torch.Tensor:
+        """Plan one action: CEM when free, recovery turn when stuck."""
         if vis.dim() == 3:
             vis = vis.unsqueeze(0)
         if proprio is not None and proprio.dim() == 1:
@@ -333,6 +347,28 @@ class CEMPlanner:
 
         z_raw = self.wm.encode_raw(vis, proprio)
 
+        # Stuck detection
+        self._is_stuck = self._stuck.update(z_raw)
+        if self._is_stuck:
+            self._turn_remaining = pyrandom.randint(
+                self.cfg.turn_steps_min, self.cfg.turn_steps_max,
+            )
+            self._turn_yaw = pyrandom.choice([-1.0, 1.0]) * pyrandom.uniform(
+                self.cfg.turn_yaw_min, self.cfg.turn_yaw_max,
+            )
+            self._prev_mean = None  # clear warm-start
+
+        # If in recovery turn, bypass CEM
+        if self._turn_remaining > 0:
+            self._turn_remaining -= 1
+            self._ensure_coverage(z_raw.shape[-1])
+            self._coverage.mark(z_raw)
+            cmd = torch.tensor(
+                [0.10, 0.0, self._turn_yaw], device=self.device,
+            )
+            return cmd.clamp(self._lo, self._hi)
+
+        # Normal CEM planning
         z_goal_proj = None
         if goal_vis is not None:
             if goal_vis.dim() == 3:
@@ -341,30 +377,35 @@ class CEMPlanner:
                 goal_proprio = goal_proprio.unsqueeze(0)
             z_goal_proj = self.wm.encode_observation(goal_vis, goal_proprio)
 
-        return self.plan(z_raw, z_goal_proj)
-
-    def step(
-        self,
-        vis: torch.Tensor,
-        proprio: torch.Tensor | None,
-        goal_vis: Optional[torch.Tensor] = None,
-        goal_proprio: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Plan and return only the first action (for MPC loop).
-
-        Returns:
-            (action_dim,) -- action to execute this timestep.
-        """
-        action_seq, _ = self.plan_from_obs(vis, proprio, goal_vis, goal_proprio)
+        action_seq, _ = self.plan(z_raw, z_goal_proj)
         return action_seq[0]
+
+    # ------------------------------------------------------------------ #
+    # Properties
+    # ------------------------------------------------------------------ #
 
     @property
     def coverage(self) -> Optional[LatentCoverageGrid]:
-        """Access the coverage grid (for HUD rendering / metrics)."""
         return self._coverage
 
+    @property
+    def is_stuck(self) -> bool:
+        return self._is_stuck
+
+    @property
+    def is_turning(self) -> bool:
+        return self._turn_remaining > 0
+
+    @property
+    def stuck_events(self) -> int:
+        return self._stuck.total_stuck_events
+
     def reset(self):
-        """Clear warm-start state and coverage grid (call between episodes)."""
+        """Clear all state between episodes."""
         self._prev_mean = None
+        self._is_stuck = False
+        self._turn_remaining = 0
+        self._turn_yaw = 0.0
         if self._coverage is not None:
             self._coverage.clear()
+        self._stuck.reset()

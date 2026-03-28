@@ -95,13 +95,13 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no_video", action="store_true")
     p.add_argument("--out", type=str, default="eval_results/cem_eval.mp4")
-    # CEM config
+    # CEM / exploration config
     p.add_argument("--horizon", type=int, default=8)
     p.add_argument("--n_candidates", type=int, default=128)
     p.add_argument("--n_elites", type=int, default=16)
     p.add_argument("--n_iterations", type=int, default=3)
+    p.add_argument("--energy_weight", type=float, default=0.3)
     p.add_argument("--stall_penalty", type=float, default=2.0)
-    p.add_argument("--forward_bias", type=float, default=0.3)
     p.add_argument("--coverage_weight", type=float, default=2.0)
     p.add_argument("--coverage_dim", type=int, default=3)
     p.add_argument("--coverage_cells", type=int, default=8)
@@ -442,7 +442,12 @@ def compose_frame(
     draw.rectangle([0, 568, 511, 659], fill=(14, 14, 14), outline=(55, 55, 55))
     draw.text((8, 572), "events", fill=(70, 70, 70))
     for i, (ev_type, ev_text) in enumerate((event_log or [])[-4:]):
-        col = (255, 210, 60) if ev_type == "CAPTURE" else (80, 255, 120)
+        if ev_type == "CAPTURE":
+            col = (255, 210, 60)
+        elif ev_type == "STUCK":
+            col = (255, 100, 100)
+        else:
+            col = (80, 255, 120)
         draw.text((8, 587 + i * 18), ev_text, fill=col)
 
     return np.asarray(canvas)
@@ -500,7 +505,7 @@ def main():
         n_candidates=args.n_candidates,
         n_elites=args.n_elites,
         n_iterations=args.n_iterations,
-        forward_bias=(args.forward_bias, 0.0, 0.0),
+        energy_weight=args.energy_weight,
         stall_penalty=args.stall_penalty,
         coverage_weight=args.coverage_weight,
         coverage_dim=args.coverage_dim,
@@ -620,6 +625,15 @@ def main():
             cmd = planner.step(vis_t, prop_for_planner)
             cmd_3d = cmd.unsqueeze(0).to(gs.device)
 
+            # Log stuck recovery events
+            if planner.is_stuck:
+                event_log.append(
+                    ("STUCK", f"step {step:4d}  STUCK — random yaw escape "
+                              f"(event #{planner.stuck_events})")
+                )
+                if step % 100 != 0:  # avoid double-print on progress lines
+                    print(f"  [STUCK] step {step} — escape #{planner.stuck_events}")
+
             # Current energy (for HUD)
             with torch.no_grad():
                 z_proj = world_model.encode_observation(vis_t, prop_for_planner)
@@ -681,11 +695,12 @@ def main():
 
                 cov = planner.coverage
                 cov_cells = cov.cells_visited if cov else 0
+                stuck_tag = " [STUCK]" if planner.is_stuck else ""
                 status_lines = [
-                    f"step: {step}/{args.max_steps}",
+                    f"step: {step}/{args.max_steps}{stuck_tag}",
                     f"pos: ({robot_xy[0]:.2f}, {robot_xy[1]:.2f})  yaw: {math.degrees(robot_yaw):.0f}deg",
                     f"cmd: ({float(cmd[0]):.2f}, {float(cmd[1]):.2f}, {float(cmd[2]):.2f})",
-                    f"collisions: {total_collisions}",
+                    f"collisions: {total_collisions}  escapes: {planner.stuck_events}",
                     f"beacons: {sum(captured)}/{n_beacons}",
                     f"latent cells: {cov_cells}",
                 ]
@@ -704,9 +719,17 @@ def main():
                 cov = planner.coverage
                 lcells = cov.cells_visited if cov else 0
                 scov = spatial_cov.coverage_frac * 100
+                stuck_tag = " STUCK" if planner.is_stuck else ""
+                d = planner.diag
                 print(f"  step {step:4d} | energy={cur_energy:.3f} | "
                       f"beacons={sum(captured)}/{n_beacons} | col={total_collisions} | "
-                      f"lcells={lcells} | coverage={scov:.1f}%")
+                      f"lcells={lcells} | coverage={scov:.1f}% | "
+                      f"escapes={planner.stuck_events}{stuck_tag}")
+                if d:
+                    print(f"    CEM: cost={d.get('cost_mean',0):.2f}±{d.get('cost_std',0):.3f} "
+                          f"energy={d.get('energy_mean',0):.2f}±{d.get('energy_std',0):.3f} "
+                          f"z_pred_std={d.get('z_pred_std',0):.4f} "
+                          f"elite_vx={d.get('elite_vx',0):.2f} yaw={d.get('elite_yaw',0):.2f}")
 
             # All beacons found
             if all(captured):
@@ -734,6 +757,7 @@ def main():
         print(f"    Path len:       {path_length:.2f} m")
         print(f"    Latent cells:   {lcells}")
         print(f"    Spatial cells:  {scov_cells}/{spatial_cov.nx * spatial_cov.ny} ({scov_pct:.1f}%)")
+        print(f"    Stuck escapes:  {planner.stuck_events}")
         print(f"    Time:           {elapsed:.1f}s ({n_steps / elapsed:.1f} steps/s)")
 
         traj_path = os.path.join(os.path.dirname(args.out), f"trajectory_ep{ep:03d}.npy")
