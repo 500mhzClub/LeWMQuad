@@ -43,9 +43,9 @@ class ExplorerConfig:
     navigate_hold_steps: int = 8          # commit to chosen direction
     # Geometric probing: check N directions for wall proximity
     probe_distance: float = 0.18         # how far ahead to probe (m)
-    probe_n_directions: int = 7           # -90 to +90 deg fan
+    probe_n_directions: int = 13          # full 360 deg fan
     # Frontier bias: prefer unvisited cells
-    frontier_weight: float = 0.5
+    frontier_weight: float = 0.8
 
     # --- Escape ---
     escape_reverse_steps: int = 6
@@ -374,54 +374,83 @@ class GreedyEnergyPlanner:
             self._nav_hold_remaining -= 1
             return self._nav_cmd
 
-        # Probe directions: fan from -90 to +90 degrees relative to heading
+        # Probe directions: full 360 fan (13 directions)
+        # This ensures the robot can always find *some* clear direction,
+        # even in tight corridors where all forward probes are blocked.
         n_dirs = self.cfg.probe_n_directions
+        angles = np.linspace(-math.pi, math.pi, n_dirs, endpoint=False)
+
+        # Probe at two distances: near (wall avoidance) and far (path finding)
+        probe_near = self.cfg.probe_distance
+        probe_far = self.cfg.probe_distance * 2.5
+
         best_yaw_offset = 0.0
         best_score = -1e9
 
-        angles = np.linspace(-math.pi / 2, math.pi / 2, n_dirs)
-        probe_dist = self.cfg.probe_distance
-
         for angle in angles:
             world_angle = self._robot_yaw + angle
-            probe_x = self._robot_xy[0] + probe_dist * math.cos(world_angle)
-            probe_y = self._robot_xy[1] + probe_dist * math.sin(world_angle)
 
-            # Check if probe point is clear of walls
-            clear = True
+            # Near probe: is there a wall right ahead?
+            near_x = self._robot_xy[0] + probe_near * math.cos(world_angle)
+            near_y = self._robot_xy[1] + probe_near * math.sin(world_angle)
+            near_clear = True
             if self._collision_fn is not None and self._obstacle_layout is not None:
-                probe_pt = torch.tensor([[probe_x, probe_y]], dtype=torch.float32)
-                clear = not bool(self._collision_fn(
-                    probe_pt, self._obstacle_layout, margin=0.10,
+                probe_pt = torch.tensor([[near_x, near_y]], dtype=torch.float32)
+                near_clear = not bool(self._collision_fn(
+                    probe_pt, self._obstacle_layout, margin=0.06,
                 )[0])
 
-            # Score: clearance (1 or 0) + frontier novelty + forward preference
-            score = 0.0
-            if clear:
-                score += 1.0
-            else:
-                score -= 1.0  # strongly avoid blocked directions
+            # Far probe: is the path ahead open?
+            far_x = self._robot_xy[0] + probe_far * math.cos(world_angle)
+            far_y = self._robot_xy[1] + probe_far * math.sin(world_angle)
+            far_clear = True
+            if self._collision_fn is not None and self._obstacle_layout is not None:
+                probe_pt = torch.tensor([[far_x, far_y]], dtype=torch.float32)
+                far_clear = not bool(self._collision_fn(
+                    probe_pt, self._obstacle_layout, margin=0.06,
+                )[0])
 
-            # Frontier novelty at probe point
+            # Score: near clearance is critical, far clearance is a bonus
+            score = 0.0
+            if near_clear:
+                score += 2.0
+                if far_clear:
+                    score += 1.0
+            else:
+                score -= 2.0
+
+            # Frontier novelty at the far probe point
             if self.cfg.frontier_weight > 0:
-                novelty = self._frontier.novelty_score(probe_x, probe_y, radius=2)
+                novelty = self._frontier.novelty_score(far_x, far_y, radius=3)
                 score += self.cfg.frontier_weight * novelty
 
-            # Prefer forward (less turning)
-            score -= 0.3 * abs(angle)
+            # Prefer forward (less turning) — but mild penalty so frontier
+            # and clearance can override
+            abs_angle = abs(angle)
+            if abs_angle > math.pi:
+                abs_angle = 2 * math.pi - abs_angle
+            score -= 0.15 * abs_angle
 
             if score > best_score:
                 best_score = score
                 best_yaw_offset = angle
 
-        # Convert best direction to velocity command
-        # Map yaw offset to yaw_rate: larger offset = harder turn
-        yaw_rate = best_yaw_offset * 2.5  # scale factor
-        yaw_rate = max(-1.5, min(1.5, yaw_rate))
+        # Wrap angle to [-pi, pi]
+        if best_yaw_offset > math.pi:
+            best_yaw_offset -= 2 * math.pi
 
-        # Speed: slower when turning hard
-        speed = self.cfg.navigate_speed * (1.0 - 0.5 * abs(yaw_rate) / 1.5)
-        speed = max(0.10, speed)
+        # Convert to velocity command
+        yaw_rate = max(-1.5, min(1.5, best_yaw_offset * 2.0))
+
+        # Speed: proportional to how forward the chosen direction is
+        abs_yaw = abs(yaw_rate)
+        if abs_yaw > 1.2:
+            # Nearly turning in place — go slow
+            speed = 0.08
+        elif abs_yaw > 0.6:
+            speed = self.cfg.navigate_speed * 0.6
+        else:
+            speed = self.cfg.navigate_speed
 
         cmd = torch.tensor([speed, 0.0, yaw_rate], device=self.device)
 
