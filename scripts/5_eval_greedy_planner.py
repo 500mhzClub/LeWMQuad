@@ -102,9 +102,13 @@ def parse_args():
     p.add_argument("--no_video", action="store_true")
     p.add_argument("--out", type=str, default="eval_results/greedy_eval.mp4")
     # Greedy planner config
+    p.add_argument("--hold_steps", type=int, default=5,
+                   help="Steps to hold each action primitive for scoring")
     p.add_argument("--energy_weight", type=float, default=1.0)
     p.add_argument("--beacon_weight", type=float, default=0.5)
     p.add_argument("--frontier_weight", type=float, default=0.2)
+    p.add_argument("--forward_bonus", type=float, default=0.4,
+                   help="Reward for positive vx to break energy ties")
     p.add_argument("--refine_candidates", type=int, default=16)
     p.add_argument("--escape_reverse_steps", type=int, default=8)
     p.add_argument("--escape_turn_steps_min", type=int, default=10)
@@ -548,9 +552,11 @@ def main():
     print(f"  Energy head: {args.energy_ckpt}")
 
     greedy_config = GreedyConfig(
+        hold_steps=args.hold_steps,
         energy_weight=args.energy_weight,
         beacon_weight=args.beacon_weight,
         frontier_weight=args.frontier_weight,
+        forward_bonus=args.forward_bonus,
         refine_candidates=args.refine_candidates,
         escape_reverse_steps=args.escape_reverse_steps,
         escape_turn_steps_min=args.escape_turn_steps_min,
@@ -806,6 +812,7 @@ def main():
                 if d:
                     print(f"    Greedy: cost={d.get('cost_min',0):.3f}/{d.get('cost_mean',0):.3f} "
                           f"energy={d.get('energy_min',0):.3f}/{d.get('energy_mean',0):.3f} "
+                          f"e_spread={d.get('energy_spread',0):.3f} "
                           f"best_vx={d.get('best_vx',0):.2f} yaw={d.get('best_yaw',0):.2f} "
                           f"beacon_bonus={d.get('beacon_bonus_max',0):.3f}")
 

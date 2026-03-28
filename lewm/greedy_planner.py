@@ -65,10 +65,17 @@ class GreedyConfig:
     action_low: Tuple[float, float, float] = (-0.5, -0.3, -1.5)
     action_high: Tuple[float, float, float] = (0.5, 0.3, 1.5)
 
+    # How many steps to hold each action primitive for scoring.
+    # 1-step predictions produce near-identical latents (~1.5cm displacement)
+    # which the energy head cannot discriminate.  5 steps ≈ 7cm displacement
+    # and stays within the predictor's accurate regime (seq_len=4 + 1).
+    hold_steps: int = 5
+
     # Scoring weights
     energy_weight: float = 1.0       # energy head cost
     beacon_weight: float = 0.5       # beacon proximity reward
     frontier_weight: float = 0.2     # frontier exploration reward
+    forward_bonus: float = 0.4       # reward positive vx to break energy ties
 
     # Contact escape parameters
     escape_reverse_steps: int = 8    # steps spent reversing
@@ -370,39 +377,46 @@ class GreedyEnergyPlanner:
         z_raw: torch.Tensor,
         z_proj: torch.Tensor,
     ) -> torch.Tensor:
-        """Score action primitives and return the best one."""
+        """Score action primitives held for K steps and return the best one.
+
+        Each primitive is repeated for ``hold_steps`` to produce enough
+        latent displacement for the energy head to discriminate.
+        """
         N = self._actions.shape[0]
+        H = self.cfg.hold_steps
 
-        # Expand z_raw for batch prediction: (N, 1, D)
-        z_expand = z_raw.expand(N, -1).unsqueeze(1)
-        # Actions as (N, 1, 3) — single-step sequences
-        a_expand = self._actions.unsqueeze(1)
+        # Expand z_raw for batch rollout: (N, D)
+        z_start = z_raw.expand(N, -1)
 
-        # Single-step prediction for all primitives
-        z_pred_raw = self.wm.predictor.predict_step(z_expand, a_expand)
-        z_pred_proj = self.wm.pred_projector(z_pred_raw)  # (N, D)
+        # Repeat each action H times: (N, H, 3)
+        action_seq = self._actions.unsqueeze(1).expand(N, H, 3)
 
-        # Energy cost (lower energy = safer/more traversable)
-        energy = self.eh(z_pred_proj)  # (N,)
+        # Rollout predictor auto-regressively for H steps
+        z_pred_seq = self.wm.plan_rollout(z_start, action_seq)  # (N, H, D)
+
+        # Score with energy head: mean energy over the K-step trajectory
+        energy = self.eh.score_trajectory(z_pred_seq) / float(H)  # (N,)
         costs = self.cfg.energy_weight * energy
 
-        # Beacon attraction
+        # Forward-motion bonus: reward positive vx to break ties in flat
+        # energy regions.  Without this the planner prefers spinning
+        # because nearby latents all score similarly.
+        if self.cfg.forward_bonus > 0:
+            costs = costs - self.cfg.forward_bonus * self._actions[:, 0]
+
+        # Beacon attraction: use terminal predicted latent
+        z_terminal = z_pred_seq[:, -1, :]  # (N, D)
         beacon_bonus = torch.zeros(N, device=self.device)
         active_targets = {
             k: v for k, v in self._beacon_targets.items()
             if k not in self._captured_beacons
         }
         if active_targets:
-            # Stack all target latents: (M, D)
             target_stack = torch.stack(list(active_targets.values()))
-            # Distance from each predicted latent to each beacon: (N, M)
-            dists = torch.cdist(z_pred_proj, target_stack)  # (N, M)
-            # Use minimum distance to any uncaptured beacon
-            min_dists = dists.min(dim=1).values  # (N,)
-            # Also compute current distance for relative improvement
+            dists = torch.cdist(z_terminal, target_stack)       # (N, M)
+            min_dists = dists.min(dim=1).values                 # (N,)
             cur_dists = torch.cdist(z_proj, target_stack).min(dim=1).values  # (1,)
-            # Reward: how much closer does this action bring us?
-            improvement = cur_dists - min_dists  # positive = good
+            improvement = cur_dists - min_dists                 # positive = good
             beacon_bonus = improvement.squeeze()
             if beacon_bonus.dim() == 0:
                 beacon_bonus = beacon_bonus.unsqueeze(0)
@@ -418,7 +432,7 @@ class GreedyEnergyPlanner:
             frontier_t = torch.from_numpy(frontier_scores).to(self.device)
             costs = costs - self.cfg.frontier_weight * frontier_t
 
-        # Optional momentum: slightly prefer continuing current action
+        # Optional momentum
         if self.cfg.momentum > 0 and self._prev_action is not None:
             similarity = (self._actions * self._prev_action.unsqueeze(0)).sum(dim=-1)
             costs = costs - self.cfg.momentum * similarity
@@ -438,6 +452,7 @@ class GreedyEnergyPlanner:
             "cost_max": float(costs.max()),
             "energy_mean": float(energy.mean()),
             "energy_min": float(energy.min()),
+            "energy_spread": float(energy.max() - energy.min()),
             "best_energy": float(energy[best_idx]),
             "beacon_bonus_max": float(beacon_bonus.max()) if active_targets else 0.0,
             "best_vx": float(best_action[0]),
@@ -452,18 +467,20 @@ class GreedyEnergyPlanner:
         z_raw: torch.Tensor,
         center: torch.Tensor,
     ) -> torch.Tensor:
-        """Small CEM refinement around the best primitive."""
+        """Small CEM refinement around the best primitive (K-step rollout)."""
         K = self.cfg.refine_candidates
+        H = self.cfg.hold_steps
         noise = torch.randn(K, 3, device=self.device) * self.cfg.refine_std
         candidates = (center.unsqueeze(0) + noise).clamp(self._lo, self._hi)
 
-        z_expand = z_raw.expand(K, -1).unsqueeze(1)
-        a_expand = candidates.unsqueeze(1)
+        z_start = z_raw.expand(K, -1)
+        action_seq = candidates.unsqueeze(1).expand(K, H, 3)
 
-        z_pred_raw = self.wm.predictor.predict_step(z_expand, a_expand)
-        z_pred_proj = self.wm.pred_projector(z_pred_raw)
-
-        energy = self.eh(z_pred_proj)
+        z_pred_seq = self.wm.plan_rollout(z_start, action_seq)  # (K, H, D)
+        energy = self.eh.score_trajectory(z_pred_seq) / float(H)
+        # Include forward bonus in refinement too
+        if self.cfg.forward_bonus > 0:
+            energy = energy - self.cfg.forward_bonus * candidates[:, 0]
         best_idx = energy.argmin()
         return candidates[best_idx]
 
