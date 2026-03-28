@@ -22,6 +22,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -41,10 +42,61 @@ class CEMConfig:
     forward_bias: Tuple[float, float, float] = (0.3, 0.0, 0.0)
     # Penalty weight for low forward velocity (encourages exploration)
     stall_penalty: float = 0.5
+    # Latent novelty bonus (rewards visiting unseen latent regions)
+    novelty_weight: float = 0.3
+    memory_capacity: int = 200
     # Momentum for warm-start blending (0 = pure warm-start, 1 = pure re-init)
     warmstart_decay: float = 0.0
     # Optional goal-matching weight (0 = energy-only)
     goal_weight: float = 0.0
+
+
+class LatentMemory:
+    """Fixed-size FIFO buffer of L2-normalized latents for novelty scoring.
+
+    Stores recent observations so the planner can reward trajectories
+    that visit novel regions of latent space.  Similarity is cosine-based
+    (cheap dot products after pre-normalisation).
+    """
+
+    def __init__(self, capacity: int, latent_dim: int, device: torch.device):
+        self.capacity = capacity
+        self.device = device
+        self.buffer = torch.empty(0, latent_dim, device=device)
+
+    def push(self, z: torch.Tensor):
+        """Append a latent observation.  z: (1, D) or (D,)."""
+        if z.dim() == 1:
+            z = z.unsqueeze(0)
+        z_norm = F.normalize(z.float(), dim=-1)
+        self.buffer = torch.cat([self.buffer, z_norm], dim=0)
+        if self.buffer.shape[0] > self.capacity:
+            self.buffer = self.buffer[-self.capacity :]
+
+    def novelty(self, z_seq: torch.Tensor) -> torch.Tensor:
+        """Score how novel each candidate trajectory is w.r.t. the buffer.
+
+        Args:
+            z_seq: (N, H, D) — predicted latent trajectories from rollout.
+
+        Returns:
+            (N,) — summed novelty per candidate (higher = more novel).
+        """
+        if self.buffer.shape[0] == 0:
+            return torch.zeros(z_seq.shape[0], device=self.device)
+        N, H, D = z_seq.shape
+        z_flat = F.normalize(z_seq.reshape(N * H, D).float(), dim=-1)
+        # Cosine similarity to every memory entry
+        sim = z_flat @ self.buffer.T          # (N*H, M)
+        max_sim = sim.max(dim=-1).values      # (N*H,)
+        # novelty = 1 - nearest-neighbour similarity, summed over horizon
+        return (1.0 - max_sim).reshape(N, H).sum(dim=1)
+
+    def clear(self):
+        self.buffer = self.buffer[:0]
+
+    def __len__(self):
+        return self.buffer.shape[0]
 
 
 class CEMPlanner:
@@ -82,6 +134,13 @@ class CEMPlanner:
         # Warm-start state
         self._prev_mean: Optional[torch.Tensor] = None
 
+        # Latent novelty memory
+        self._memory = LatentMemory(
+            capacity=self.cfg.memory_capacity,
+            latent_dim=0,   # will be set lazily on first push
+            device=self.device,
+        )
+
     # ------------------------------------------------------------------ #
     # Core planning
     # ------------------------------------------------------------------ #
@@ -106,6 +165,16 @@ class CEMPlanner:
             z_raw = z_raw.unsqueeze(0)
         if z_goal_proj is not None and z_goal_proj.dim() == 1:
             z_goal_proj = z_goal_proj.unsqueeze(0)
+
+        # Push current observation into novelty memory
+        if self._memory.capacity > 0:
+            if self._memory.buffer.shape[0] == 0:
+                # Lazy init with correct latent dim
+                D_latent = z_raw.shape[-1]
+                self._memory = LatentMemory(
+                    self.cfg.memory_capacity, D_latent, self.device,
+                )
+            self._memory.push(z_raw)
 
         H = self.cfg.horizon
         N = self.cfg.n_candidates
@@ -142,6 +211,11 @@ class CEMPlanner:
             if self.cfg.stall_penalty > 0:
                 fwd_speed = actions[:, :, 0].mean(dim=1)  # avg vx over horizon
                 costs = costs - self.cfg.stall_penalty * fwd_speed
+
+            # Novelty bonus (reward visiting unseen latent regions)
+            if self.cfg.novelty_weight > 0 and len(self._memory) > 0:
+                novelty = self._memory.novelty(z_pred)    # (N,)
+                costs = costs - self.cfg.novelty_weight * novelty
 
             # Optional goal cost
             if z_goal_proj is not None and self.cfg.goal_weight > 0:
@@ -219,5 +293,6 @@ class CEMPlanner:
         return action_seq[0]
 
     def reset(self):
-        """Clear warm-start state (call between episodes)."""
+        """Clear warm-start state and novelty memory (call between episodes)."""
         self._prev_mean = None
+        self._memory.clear()

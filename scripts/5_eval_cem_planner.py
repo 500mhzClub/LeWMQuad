@@ -102,6 +102,8 @@ def parse_args():
     p.add_argument("--n_iterations", type=int, default=3)
     p.add_argument("--stall_penalty", type=float, default=0.5)
     p.add_argument("--forward_bias", type=float, default=0.3)
+    p.add_argument("--novelty_weight", type=float, default=0.3)
+    p.add_argument("--memory_capacity", type=int, default=200)
     # Model config
     p.add_argument("--latent_dim", type=int, default=192)
     p.add_argument("--image_size", type=int, default=224)
@@ -446,6 +448,8 @@ def main():
         n_iterations=args.n_iterations,
         forward_bias=(args.forward_bias, 0.0, 0.0),
         stall_penalty=args.stall_penalty,
+        novelty_weight=args.novelty_weight,
+        memory_capacity=args.memory_capacity,
     )
     planner = CEMPlanner(world_model, energy_head, config=cem_config, device=device)
 
@@ -622,6 +626,7 @@ def main():
                     f"cmd: ({float(cmd[0]):.2f}, {float(cmd[1]):.2f}, {float(cmd[2]):.2f})",
                     f"collisions: {total_collisions}",
                     f"beacons: {sum(captured)}/{n_beacons}",
+                    f"memory: {len(planner._memory)}/{args.memory_capacity}",
                 ]
 
                 frame = compose_frame(
