@@ -102,9 +102,9 @@ def parse_args():
     p.add_argument("--n_iterations", type=int, default=3)
     p.add_argument("--stall_penalty", type=float, default=2.0)
     p.add_argument("--forward_bias", type=float, default=0.3)
-    p.add_argument("--coverage_weight", type=float, default=1.0)
-    p.add_argument("--coverage_dim", type=int, default=8)
-    p.add_argument("--coverage_cells", type=int, default=16)
+    p.add_argument("--coverage_weight", type=float, default=2.0)
+    p.add_argument("--coverage_dim", type=int, default=3)
+    p.add_argument("--coverage_cells", type=int, default=8)
     # Model config
     p.add_argument("--latent_dim", type=int, default=192)
     p.add_argument("--image_size", type=int, default=224)

@@ -45,9 +45,9 @@ class CEMConfig:
     # Penalty weight for low forward velocity (encourages exploration)
     stall_penalty: float = 2.0
     # Latent coverage grid (random-projection hash)
-    coverage_weight: float = 1.0
-    coverage_dim: int = 8          # dimensionality of the hash projection
-    coverage_cells: int = 16       # bins per projected dimension
+    coverage_weight: float = 2.0
+    coverage_dim: int = 3          # dimensionality of the hash projection
+    coverage_cells: int = 8        # bins per projected dimension (8^3 = 512 cells)
     # Momentum for warm-start blending (0 = pure warm-start, 1 = pure re-init)
     warmstart_decay: float = 0.0
     # Optional goal-matching weight (0 = energy-only)
