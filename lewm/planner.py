@@ -1,10 +1,12 @@
 """CEM planner over latent energy landscape with exploration.
 
 Scores candidate action sequences by rolling them out through the
-world model predictor and summing per-step energy from the
-LatentEnergyHead.  A latent coverage grid rewards trajectories that
-visit novel regions of representation space, and a stuck detector
-forces random recovery turns when the robot's observations stop changing.
+world model predictor and scoring them with the LatentEnergyHead.
+A latent coverage grid rewards trajectories that visit novel regions
+of representation space, but only when those trajectories also
+translate through space rather than spinning in place. A stuck detector
+forces recovery turns when the robot's observations or recent pose
+history stop changing enough.
 
 Typical usage::
 
@@ -32,7 +34,7 @@ import torch.nn.functional as F
 @dataclass
 class CEMConfig:
     """All CEM hyper-parameters in one place."""
-    horizon: int = 12
+    horizon: int = 15
     n_candidates: int = 128
     n_elites: int = 16
     n_iterations: int = 3
@@ -43,11 +45,13 @@ class CEMConfig:
     init_std: float = 0.5
     min_std: float = 0.01
     # Forward-motion bias for initial CEM mean (vx, vy, yaw_rate)
-    forward_bias: Tuple[float, float, float] = (0.2, 0.0, 0.0)
+    forward_bias: Tuple[float, float, float] = (0.25, 0.0, 0.0)
     # Cost component weights
-    energy_weight: float = 1.0     # primary planning signal
-    stall_penalty: float = 0.5     # gentle forward nudge
+    energy_weight: float = 1.0     # mean per-step energy
+    stall_penalty: float = 1.0     # forward progress reward in free space
     coverage_weight: float = 0.3   # mild novelty drive
+    yaw_penalty: float = 0.35      # discourage spin-in-place when free
+    coverage_motion_scale: float = 0.20  # speed needed for full novelty credit
     # Collision-reactive planning (when sim reports wall contact)
     collision_fwd_penalty: float = 8.0   # penalize vx>0 when colliding
     collision_yaw_bonus: float = 4.0     # reward |yaw_rate| when colliding
@@ -58,6 +62,9 @@ class CEMConfig:
     stuck_window: int = 25
     stuck_threshold: float = 0.02
     stuck_patience: int = 8
+    # Pose-based local stagnation detection
+    position_window: int = 60
+    position_radius: float = 0.35
     # Recovery turn parameters
     turn_steps_min: int = 15
     turn_steps_max: int = 45
@@ -66,6 +73,7 @@ class CEMConfig:
     # Fraction of recovery spent reversing before turning
     reverse_fraction: float = 0.4
     reverse_speed: float = -0.3
+    escape_forward_speed: float = 0.25
     # Grace period after recovery before stuck detection resumes
     post_recovery_grace: int = 15
     # Momentum for warm-start
@@ -200,8 +208,9 @@ class CEMPlanner:
     Normal operation:
       1. Sample N action sequences from N(mean, std).
       2. Rollout through the world model predictor.
-      3. Score: energy_weight * energy - stall_penalty * fwd_speed
-                - coverage_weight * novelty
+      3. Score: energy_weight * mean_energy - stall_penalty * fwd_speed
+                - coverage_weight * motion-gated novelty
+                + yaw penalty in free space
                 + collision-reactive terms when contact is reported
       4. Refit from elites. Repeat.
 
@@ -241,6 +250,7 @@ class CEMPlanner:
         self._is_stuck: bool = False
         self._turn_remaining: int = 0
         self._turn_total: int = 0       # total steps in current recovery
+        self._turn_reverse_steps: int = 0
         self._turn_yaw: float = 0.0
         self._grace_remaining: int = 0  # post-recovery grace period
 
@@ -250,6 +260,9 @@ class CEMPlanner:
 
         # Alternating recovery direction
         self._last_turn_sign: float = 1.0
+
+        # Pose history for local stagnation detection
+        self._position_window: deque = deque(maxlen=self.cfg.position_window)
 
         # Diagnostics from last CEM iteration
         self.diag: dict = {}
@@ -315,8 +328,10 @@ class CEMPlanner:
             # JEPA rollout
             z_pred = self.wm.plan_rollout(z_start, actions)
 
-            # Weighted energy cost (down-weighted so it doesn't dominate)
-            costs = self.cfg.energy_weight * self.eh.score_trajectory(z_pred)
+            # Mean per-step energy keeps horizon scaling comparable to the
+            # command-based terms below.
+            energy = self.eh.score_trajectory(z_pred) / float(H)
+            costs = self.cfg.energy_weight * energy
 
             # Forward-velocity bonus
             if self.cfg.stall_penalty > 0:
@@ -324,7 +339,15 @@ class CEMPlanner:
 
             # Latent coverage bonus
             if self.cfg.coverage_weight > 0 and self._coverage.total_visits > 0:
-                costs = costs - self.cfg.coverage_weight * self._coverage.novelty_batch(z_pred)
+                novelty = self._coverage.novelty_batch(z_pred) / float(H)
+                lin_speed = actions[:, :, :2].norm(dim=-1).mean(dim=1)
+                motion_gate = (lin_speed / max(self.cfg.coverage_motion_scale, 1e-6)).clamp(0.0, 1.0)
+                costs = costs - self.cfg.coverage_weight * novelty * motion_gate
+
+            # Free-space yaw penalty: latent novelty can otherwise be hacked by
+            # rotating in place and changing the camera view without exploring.
+            if not colliding and self.cfg.yaw_penalty > 0:
+                costs = costs + self.cfg.yaw_penalty * actions[:, :, 2].abs().mean(dim=1)
 
             # Collision-reactive: penalize forward, reward turning
             if colliding:
@@ -351,8 +374,8 @@ class CEMPlanner:
             "cost_std": float(costs.std()),
             "cost_min": float(costs.min()),
             "cost_max": float(costs.max()),
-            "energy_mean": float(self.eh.score_trajectory(z_pred).mean()),
-            "energy_std": float(self.eh.score_trajectory(z_pred).std()),
+            "energy_mean": float(energy.mean()),
+            "energy_std": float(energy.std()),
             "z_pred_std": float(z_pred.std()),
             "elite_vx": float(elite_actions[:, :, 0].mean()),
             "elite_yaw": float(elite_actions[:, :, 2].mean()),
@@ -388,22 +411,22 @@ class CEMPlanner:
             self._coverage.mark(z_raw)
 
             # First phase: reverse to back away from obstacle
-            reverse_steps = int(self._turn_total * self.cfg.reverse_fraction)
             steps_done = self._turn_total - self._turn_remaining - 1
-            if steps_done < reverse_steps:
+            if steps_done < self._turn_reverse_steps:
                 cmd = torch.tensor(
                     [self.cfg.reverse_speed, 0.0, 0.0], device=self.device,
                 )
             else:
                 # Second phase: forward + turn
                 cmd = torch.tensor(
-                    [0.20, 0.0, self._turn_yaw], device=self.device,
+                    [self.cfg.escape_forward_speed, 0.0, self._turn_yaw], device=self.device,
                 )
 
             if self._turn_remaining == 0:
                 # Recovery just ended — start grace period
                 self._grace_remaining = self.cfg.post_recovery_grace
                 self._collision_window.clear()
+                self._position_window.clear()
                 self._stuck._latents.clear()
                 self._stuck._stuck_count = 0
             return cmd.clamp(self._lo, self._hi)
@@ -417,18 +440,23 @@ class CEMPlanner:
             # Stuck detection: latent velocity OR collision rate
             latent_stuck = self._stuck.update(z_raw)
             collision_stuck = self._collision_stuck()
-            self._is_stuck = latent_stuck or collision_stuck
+            position_stuck = self._position_stuck()
+            self._is_stuck = latent_stuck or collision_stuck or position_stuck
             if self._is_stuck:
                 self._turn_total = pyrandom.randint(
                     self.cfg.turn_steps_min, self.cfg.turn_steps_max,
                 )
                 self._turn_remaining = self._turn_total
+                self._turn_reverse_steps = (
+                    int(self._turn_total * self.cfg.reverse_fraction)
+                    if collision_stuck else 0
+                )
                 self._turn_yaw = self._last_turn_sign * pyrandom.uniform(
                     self.cfg.turn_yaw_min, self.cfg.turn_yaw_max,
                 )
                 self._last_turn_sign *= -1.0  # alternate for next recovery
                 self._prev_mean = None  # clear warm-start
-                if collision_stuck:
+                if not latent_stuck and (collision_stuck or position_stuck):
                     self._stuck.total_stuck_events += 1
                 # Immediately start recovery on this step (fall through to
                 # the recovery branch on the next call; for this step, just
@@ -438,7 +466,12 @@ class CEMPlanner:
                 self._ensure_coverage(z_raw.shape[-1])
                 self._coverage.mark(z_raw)
                 cmd = torch.tensor(
-                    [self.cfg.reverse_speed, 0.0, 0.0], device=self.device,
+                    [
+                        self.cfg.reverse_speed if self._turn_reverse_steps > 0 else self.cfg.escape_forward_speed,
+                        0.0,
+                        0.0 if self._turn_reverse_steps > 0 else self._turn_yaw,
+                    ],
+                    device=self.device,
                 )
                 return cmd.clamp(self._lo, self._hi)
 
@@ -463,6 +496,15 @@ class CEMPlanner:
         """Feed collision signal from the sim (proprioceptive feedback)."""
         self._collision_window.append(colliding)
 
+    def report_pose(self, xy: np.ndarray | torch.Tensor):
+        """Feed world-frame XY pose for local stagnation detection."""
+        if isinstance(xy, torch.Tensor):
+            xy = xy.detach().float().cpu().numpy()
+        xy = np.asarray(xy, dtype=np.float32).reshape(-1)
+        if xy.shape[0] != 2:
+            raise ValueError(f"Expected XY pose with shape (2,), got {xy.shape}")
+        self._position_window.append(xy.copy())
+
     def _collision_stuck(self) -> bool:
         """True if the robot is colliding too frequently (stuck in wall)."""
         if len(self._collision_window) < self._collision_window.maxlen:
@@ -473,6 +515,15 @@ class CEMPlanner:
         """True if colliding frequently in recent steps (for reactive CEM cost)."""
         recent = list(self._collision_window)[-3:]
         return len(recent) >= 3 and sum(recent) >= 2
+
+    def _position_stuck(self) -> bool:
+        """True if recent poses stay inside a small radius."""
+        if len(self._position_window) < self._position_window.maxlen:
+            return False
+        pts = np.stack(self._position_window, axis=0)
+        center = pts.mean(axis=0, keepdims=True)
+        radius = np.linalg.norm(pts - center, axis=1).max()
+        return bool(radius < self.cfg.position_radius)
 
     @property
     def coverage(self) -> Optional[LatentCoverageGrid]:
@@ -496,10 +547,12 @@ class CEMPlanner:
         self._is_stuck = False
         self._turn_remaining = 0
         self._turn_total = 0
+        self._turn_reverse_steps = 0
         self._turn_yaw = 0.0
         self._last_turn_sign = 1.0
         self._grace_remaining = 0
         self._collision_window.clear()
+        self._position_window.clear()
         self.diag = {}
         if self._coverage is not None:
             self._coverage.clear()

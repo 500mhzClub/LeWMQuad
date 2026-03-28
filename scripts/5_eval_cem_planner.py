@@ -96,15 +96,19 @@ def parse_args():
     p.add_argument("--no_video", action="store_true")
     p.add_argument("--out", type=str, default="eval_results/cem_eval.mp4")
     # CEM / exploration config
-    p.add_argument("--horizon", type=int, default=12)
+    p.add_argument("--horizon", type=int, default=15)
     p.add_argument("--n_candidates", type=int, default=128)
     p.add_argument("--n_elites", type=int, default=16)
     p.add_argument("--n_iterations", type=int, default=3)
     p.add_argument("--energy_weight", type=float, default=1.0)
-    p.add_argument("--stall_penalty", type=float, default=0.5)
+    p.add_argument("--stall_penalty", type=float, default=1.0)
     p.add_argument("--coverage_weight", type=float, default=0.3)
+    p.add_argument("--yaw_penalty", type=float, default=0.35)
+    p.add_argument("--coverage_motion_scale", type=float, default=0.20)
     p.add_argument("--collision_fwd_penalty", type=float, default=8.0)
     p.add_argument("--collision_yaw_bonus", type=float, default=4.0)
+    p.add_argument("--position_window", type=int, default=60)
+    p.add_argument("--position_radius", type=float, default=0.35)
     p.add_argument("--coverage_dim", type=int, default=3)
     p.add_argument("--coverage_cells", type=int, default=8)
     # Model config
@@ -510,8 +514,12 @@ def main():
         energy_weight=args.energy_weight,
         stall_penalty=args.stall_penalty,
         coverage_weight=args.coverage_weight,
+        yaw_penalty=args.yaw_penalty,
+        coverage_motion_scale=args.coverage_motion_scale,
         collision_fwd_penalty=args.collision_fwd_penalty,
         collision_yaw_bonus=args.collision_yaw_bonus,
+        position_window=args.position_window,
+        position_radius=args.position_radius,
         coverage_dim=args.coverage_dim,
         coverage_cells=args.coverage_cells,
     )
@@ -610,6 +618,7 @@ def main():
             robot_xy = robot_pos_3d[:2].astype(np.float32)
             trail.append(robot_xy.copy())
             spatial_cov.mark(float(robot_xy[0]), float(robot_xy[1]))
+            planner.report_pose(robot_xy)
 
             # Render brain camera for JEPA encoder
             brain_rgb = render_rgb(cam_brain)
@@ -632,7 +641,7 @@ def main():
             # Log stuck recovery events
             if planner.is_stuck:
                 event_log.append(
-                    ("STUCK", f"step {step:4d}  STUCK — random yaw escape "
+                    ("STUCK", f"step {step:4d}  STUCK — escape maneuver "
                               f"(event #{planner.stuck_events})")
                 )
                 if step % 100 != 0:  # avoid double-print on progress lines
