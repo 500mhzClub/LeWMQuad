@@ -267,6 +267,10 @@ class TransformerPredictor(nn.Module):
         for step in range(horizon):
             z_ctx = torch.cat(z_buffer, dim=1)
             a_ctx = action_seq[:, : step + 1, :]
+            # Sliding window: keep only the last max_seq_len tokens
+            if z_ctx.shape[1] > self.max_seq_len:
+                z_ctx = z_ctx[:, -self.max_seq_len:]
+                a_ctx = a_ctx[:, -self.max_seq_len:]
             pred = self.forward(z_ctx, a_ctx)
             z_next = pred[:, -1, :]
             preds.append(z_next)
