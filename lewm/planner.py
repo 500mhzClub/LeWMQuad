@@ -27,16 +27,20 @@ import torch.nn as nn
 @dataclass
 class CEMConfig:
     """All CEM hyper-parameters in one place."""
-    horizon: int = 15
-    n_candidates: int = 512
-    n_elites: int = 64
-    n_iterations: int = 5
+    horizon: int = 8
+    n_candidates: int = 128
+    n_elites: int = 16
+    n_iterations: int = 3
     action_dim: int = 3
     # Per-dimension action bounds [vx, vy, yaw_rate]
     action_low: Tuple[float, float, float] = (-0.5, -0.3, -1.5)
     action_high: Tuple[float, float, float] = (0.5, 0.3, 1.5)
     init_std: float = 0.5
     min_std: float = 0.01
+    # Forward-motion bias for initial CEM mean (vx, vy, yaw_rate)
+    forward_bias: Tuple[float, float, float] = (0.3, 0.0, 0.0)
+    # Penalty weight for low forward velocity (encourages exploration)
+    stall_penalty: float = 0.5
     # Momentum for warm-start blending (0 = pure warm-start, 1 = pure re-init)
     warmstart_decay: float = 0.0
     # Optional goal-matching weight (0 = energy-only)
@@ -73,6 +77,7 @@ class CEMPlanner:
         # Pre-compute bound tensors
         self._lo = torch.tensor(self.cfg.action_low, device=self.device)
         self._hi = torch.tensor(self.cfg.action_high, device=self.device)
+        self._fwd_bias = torch.tensor(self.cfg.forward_bias, device=self.device)
 
         # Warm-start state
         self._prev_mean: Optional[torch.Tensor] = None
@@ -115,7 +120,7 @@ class CEMPlanner:
             if self.cfg.warmstart_decay > 0:
                 mean = mean * (1.0 - self.cfg.warmstart_decay)
         else:
-            mean = torch.zeros(H, D, device=self.device)
+            mean = self._fwd_bias.unsqueeze(0).expand(H, -1).clone()
         std = torch.full((H, D), self.cfg.init_std, device=self.device)
 
         # Expand z_start for all candidates: (1, D) -> (N, D)
@@ -132,6 +137,11 @@ class CEMPlanner:
 
             # Energy cost
             costs = self.eh.score_trajectory(z_pred)  # (N,)
+
+            # Forward-velocity bonus (encourages exploration)
+            if self.cfg.stall_penalty > 0:
+                fwd_speed = actions[:, :, 0].mean(dim=1)  # avg vx over horizon
+                costs = costs - self.cfg.stall_penalty * fwd_speed
 
             # Optional goal cost
             if z_goal_proj is not None and self.cfg.goal_weight > 0:

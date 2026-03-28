@@ -96,10 +96,12 @@ def parse_args():
     p.add_argument("--no_video", action="store_true")
     p.add_argument("--out", type=str, default="eval_results/cem_eval.mp4")
     # CEM config
-    p.add_argument("--horizon", type=int, default=15)
-    p.add_argument("--n_candidates", type=int, default=512)
-    p.add_argument("--n_elites", type=int, default=64)
-    p.add_argument("--n_iterations", type=int, default=5)
+    p.add_argument("--horizon", type=int, default=8)
+    p.add_argument("--n_candidates", type=int, default=128)
+    p.add_argument("--n_elites", type=int, default=16)
+    p.add_argument("--n_iterations", type=int, default=3)
+    p.add_argument("--stall_penalty", type=float, default=0.5)
+    p.add_argument("--forward_bias", type=float, default=0.3)
     # Model config
     p.add_argument("--latent_dim", type=int, default=192)
     p.add_argument("--image_size", type=int, default=224)
@@ -442,6 +444,8 @@ def main():
         n_candidates=args.n_candidates,
         n_elites=args.n_elites,
         n_iterations=args.n_iterations,
+        forward_bias=(args.forward_bias, 0.0, 0.0),
+        stall_penalty=args.stall_penalty,
     )
     planner = CEMPlanner(world_model, energy_head, config=cem_config, device=device)
 
@@ -607,8 +611,8 @@ def main():
                 event_log.append(("FALL", f"step {step:4d}  Robot fell"))
                 break
 
-            # Compose HUD frame
-            if writer is not None and step % 1 == 0:
+            # Compose HUD frame (every 2nd step to reduce camera overhead)
+            if writer is not None and step % 2 == 0:
                 over_rgb = render_rgb(cam_over)
                 eye_rgb = render_rgb(cam_eye)
 
