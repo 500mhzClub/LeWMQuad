@@ -32,7 +32,7 @@ import torch.nn.functional as F
 @dataclass
 class CEMConfig:
     """All CEM hyper-parameters in one place."""
-    horizon: int = 8
+    horizon: int = 12
     n_candidates: int = 128
     n_elites: int = 16
     n_iterations: int = 3
@@ -43,11 +43,14 @@ class CEMConfig:
     init_std: float = 0.5
     min_std: float = 0.01
     # Forward-motion bias for initial CEM mean (vx, vy, yaw_rate)
-    forward_bias: Tuple[float, float, float] = (0.3, 0.0, 0.0)
+    forward_bias: Tuple[float, float, float] = (0.2, 0.0, 0.0)
     # Cost component weights
-    energy_weight: float = 0.3     # down-weighted so it doesn't dominate
-    stall_penalty: float = 2.0     # strong forward drive
-    coverage_weight: float = 2.0   # strong novelty drive
+    energy_weight: float = 1.0     # primary planning signal
+    stall_penalty: float = 0.5     # gentle forward nudge
+    coverage_weight: float = 0.3   # mild novelty drive
+    # Collision-reactive planning (when sim reports wall contact)
+    collision_fwd_penalty: float = 8.0   # penalize vx>0 when colliding
+    collision_yaw_bonus: float = 4.0     # reward |yaw_rate| when colliding
     # Latent coverage grid (random-projection hash)
     coverage_dim: int = 3
     coverage_cells: int = 8        # 8^3 = 512 cells
@@ -192,17 +195,18 @@ class StuckDetector:
 # ---------------------------------------------------------------------- #
 
 class CEMPlanner:
-    """CEM planner with JEPA rollouts, latent coverage, and stuck recovery.
+    """CEM planner with JEPA rollouts, latent coverage, and collision-aware recovery.
 
     Normal operation:
       1. Sample N action sequences from N(mean, std).
       2. Rollout through the world model predictor.
       3. Score: energy_weight * energy - stall_penalty * fwd_speed
                 - coverage_weight * novelty
+                + collision-reactive terms when contact is reported
       4. Refit from elites. Repeat.
 
     When the stuck detector fires (latent observations stopped changing):
-      Execute a random recovery turn for 15-45 steps, bypassing CEM.
+      Execute an alternating recovery turn for 15-45 steps, bypassing CEM.
       This breaks out of dead ends where all CEM candidates look the same.
     """
 
@@ -244,6 +248,9 @@ class CEMPlanner:
         self._collision_window: deque = deque(maxlen=10)
         self._collision_threshold: int = 4  # 4+ collisions in 10 steps = stuck in wall
 
+        # Alternating recovery direction
+        self._last_turn_sign: float = 1.0
+
         # Diagnostics from last CEM iteration
         self.diag: dict = {}
 
@@ -265,6 +272,7 @@ class CEMPlanner:
         self,
         z_raw: torch.Tensor,
         z_goal_proj: Optional[torch.Tensor] = None,
+        colliding: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CEM planning from an encoded latent using JEPA rollouts."""
         if z_raw.dim() == 1:
@@ -281,12 +289,19 @@ class CEMPlanner:
         D = self.cfg.action_dim
 
         # Initialise distribution
+        # Clear warm-start when colliding — don't keep planning into walls
+        if colliding:
+            self._prev_mean = None
+
         if self._prev_mean is not None:
             mean = torch.cat([self._prev_mean[1:], self._prev_mean[-1:]], dim=0)
             if self.cfg.warmstart_decay > 0:
                 mean = mean * (1.0 - self.cfg.warmstart_decay)
         else:
-            mean = self._fwd_bias.unsqueeze(0).expand(H, -1).clone()
+            if colliding:
+                mean = torch.zeros(H, D, device=self.device)
+            else:
+                mean = self._fwd_bias.unsqueeze(0).expand(H, -1).clone()
         std = torch.full((H, D), self.cfg.init_std, device=self.device)
 
         z_start = z_raw.expand(N, -1)
@@ -310,6 +325,13 @@ class CEMPlanner:
             # Latent coverage bonus
             if self.cfg.coverage_weight > 0 and self._coverage.total_visits > 0:
                 costs = costs - self.cfg.coverage_weight * self._coverage.novelty_batch(z_pred)
+
+            # Collision-reactive: penalize forward, reward turning
+            if colliding:
+                fwd = actions[:, :, 0].clamp(min=0).mean(dim=1)
+                costs = costs + self.cfg.collision_fwd_penalty * fwd
+                yaw = actions[:, :, 2].abs().mean(dim=1)
+                costs = costs - self.cfg.collision_yaw_bonus * yaw
 
             # Goal cost
             if z_goal_proj is not None and self.cfg.goal_weight > 0:
@@ -401,9 +423,10 @@ class CEMPlanner:
                     self.cfg.turn_steps_min, self.cfg.turn_steps_max,
                 )
                 self._turn_remaining = self._turn_total
-                self._turn_yaw = pyrandom.choice([-1.0, 1.0]) * pyrandom.uniform(
+                self._turn_yaw = self._last_turn_sign * pyrandom.uniform(
                     self.cfg.turn_yaw_min, self.cfg.turn_yaw_max,
                 )
+                self._last_turn_sign *= -1.0  # alternate for next recovery
                 self._prev_mean = None  # clear warm-start
                 if collision_stuck:
                     self._stuck.total_stuck_events += 1
@@ -428,7 +451,8 @@ class CEMPlanner:
                 goal_proprio = goal_proprio.unsqueeze(0)
             z_goal_proj = self.wm.encode_observation(goal_vis, goal_proprio)
 
-        action_seq, _ = self.plan(z_raw, z_goal_proj)
+        recently_colliding = self._is_colliding_recently()
+        action_seq, _ = self.plan(z_raw, z_goal_proj, colliding=recently_colliding)
         return action_seq[0]
 
     # ------------------------------------------------------------------ #
@@ -444,6 +468,11 @@ class CEMPlanner:
         if len(self._collision_window) < self._collision_window.maxlen:
             return False
         return sum(self._collision_window) >= self._collision_threshold
+
+    def _is_colliding_recently(self) -> bool:
+        """True if colliding frequently in recent steps (for reactive CEM cost)."""
+        recent = list(self._collision_window)[-3:]
+        return len(recent) >= 3 and sum(recent) >= 2
 
     @property
     def coverage(self) -> Optional[LatentCoverageGrid]:
@@ -468,8 +497,10 @@ class CEMPlanner:
         self._turn_remaining = 0
         self._turn_total = 0
         self._turn_yaw = 0.0
+        self._last_turn_sign = 1.0
         self._grace_remaining = 0
         self._collision_window.clear()
+        self.diag = {}
         if self._coverage is not None:
             self._coverage.clear()
         self._stuck.reset()

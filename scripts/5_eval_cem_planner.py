@@ -96,13 +96,15 @@ def parse_args():
     p.add_argument("--no_video", action="store_true")
     p.add_argument("--out", type=str, default="eval_results/cem_eval.mp4")
     # CEM / exploration config
-    p.add_argument("--horizon", type=int, default=8)
+    p.add_argument("--horizon", type=int, default=12)
     p.add_argument("--n_candidates", type=int, default=128)
     p.add_argument("--n_elites", type=int, default=16)
     p.add_argument("--n_iterations", type=int, default=3)
-    p.add_argument("--energy_weight", type=float, default=0.3)
-    p.add_argument("--stall_penalty", type=float, default=2.0)
-    p.add_argument("--coverage_weight", type=float, default=2.0)
+    p.add_argument("--energy_weight", type=float, default=1.0)
+    p.add_argument("--stall_penalty", type=float, default=0.5)
+    p.add_argument("--coverage_weight", type=float, default=0.3)
+    p.add_argument("--collision_fwd_penalty", type=float, default=8.0)
+    p.add_argument("--collision_yaw_bonus", type=float, default=4.0)
     p.add_argument("--coverage_dim", type=int, default=3)
     p.add_argument("--coverage_cells", type=int, default=8)
     # Model config
@@ -508,6 +510,8 @@ def main():
         energy_weight=args.energy_weight,
         stall_penalty=args.stall_penalty,
         coverage_weight=args.coverage_weight,
+        collision_fwd_penalty=args.collision_fwd_penalty,
+        collision_yaw_bonus=args.collision_yaw_bonus,
         coverage_dim=args.coverage_dim,
         coverage_cells=args.coverage_cells,
     )
