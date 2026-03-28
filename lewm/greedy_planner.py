@@ -1,29 +1,26 @@
-"""Energy-scored explorer with collision heading memory and beacon homing.
+"""Forward-biased explorer with geometric wall probing and JEPA beacon detection.
 
-Hybrid approach: energy-scored action selection (works in open corridors)
-combined with collision heading memory (avoids returning to the wall just
-escaped from) and JEPA-guided beacon homing when close.
+Lessons from v2-v7 runs:
+  - JEPA 5-step rollouts can't discriminate actions (energy spread ~0.02)
+  - Collision heading memory paralyses the robot (all directions penalised)
+  - Beacon homing via rollout proximity doesn't work (terminal latents identical)
+  - The JEPA *can* detect beacons: beacon_dist drops when beacon is in camera FOV
 
-State machine:
-  - **ESCAPE**: reverse + ~90 deg turn.  Records the heading that caused
-    collision.  On completion -> GRACE -> NAVIGATE.
-  - **NAVIGATE**: energy-scored action selection with collision heading
-    penalty.  Short action commitment (4-6 steps).  Checks beacon
-    proximity each cycle and switches to BEACON_HOME if close.
-  - **BEACON_HOME**: JEPA rollout scores actions by beacon proximity
-    improvement.  Drops back to NAVIGATE on stall or collision.
-
-Key difference from v2: no cruise mode (caused ESCAPE->CRUISE->ESCAPE
-trap).  Instead, collision heading memory biases the robot away from
-the wall it just left without committing to a blind forward drive.
+This version:
+  - **NAVIGATE**: geometric wall probing via detect_collisions on probe points,
+    picks the clearest forward direction, biased toward unvisited frontier cells.
+    No JEPA rollouts. Strong forward commitment (8 steps).
+  - **APPROACH**: when JEPA beacon_dist < threshold, the beacon is in the FOV.
+    Walk forward with small yaw oscillation. If beacon_dist keeps dropping,
+    we're approaching. If it stalls, exit back to NAVIGATE.
+  - **ESCAPE**: reverse + turn on collision. No memory, no cruise.
 """
 from __future__ import annotations
 
 import math
 import random as pyrandom
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -34,42 +31,21 @@ import torch.nn as nn
 # Configuration
 # ---------------------------------------------------------------------- #
 
-# Discrete action primitives: (vx, vy, yaw_rate)
-ACTION_SET: List[Tuple[float, float, float]] = [
-    ( 0.35,  0.00,  0.0),    # forward
-    ( 0.30,  0.00,  0.3),    # forward-left
-    ( 0.30,  0.00, -0.3),    # forward-right
-    ( 0.20,  0.00,  0.6),    # left
-    ( 0.20,  0.00, -0.6),    # right
-    ( 0.10,  0.00,  1.0),    # sharp left
-    ( 0.10,  0.00, -1.0),    # sharp right
-    ( 0.35,  0.12,  0.0),    # forward + strafe left
-    ( 0.35, -0.12,  0.0),    # forward + strafe right
-    (-0.15,  0.00,  0.0),    # slow reverse
-    ( 0.00,  0.00,  1.2),    # spin left
-    ( 0.00,  0.00, -1.2),    # spin right
-]
-
-
 @dataclass
 class ExplorerConfig:
-    """All hyper-parameters for the energy-scored explorer."""
+    """All hyper-parameters."""
 
-    # Per-dimension action bounds
     action_low: Tuple[float, float, float] = (-0.5, -0.3, -1.5)
     action_high: Tuple[float, float, float] = (0.5, 0.3, 1.5)
 
-    # --- Navigation scoring ---
-    hold_steps: int = 5              # rollout length for scoring
-    energy_weight: float = 0.3       # low — energy head is noisy near walls
-    forward_bonus: float = 0.08      # adaptive, scales with energy spread
-    beacon_weight: float = 0.5       # beacon proximity in latent space
-    collision_heading_weight: float = 0.4  # penalty for facing recent collision headings
-    collision_heading_memory: int = 5      # remember last N collision headings
-    collision_heading_decay: float = 0.8   # older collisions matter less
-
-    # Action commitment: hold chosen action for N steps
-    action_hold_steps: int = 5
+    # --- Navigate ---
+    navigate_speed: float = 0.30          # default forward speed
+    navigate_hold_steps: int = 8          # commit to chosen direction
+    # Geometric probing: check N directions for wall proximity
+    probe_distance: float = 0.18         # how far ahead to probe (m)
+    probe_n_directions: int = 7           # -90 to +90 deg fan
+    # Frontier bias: prefer unvisited cells
+    frontier_weight: float = 0.5
 
     # --- Escape ---
     escape_reverse_steps: int = 6
@@ -80,16 +56,20 @@ class ExplorerConfig:
     escape_yaw_min: float = 1.0
     escape_yaw_max: float = 1.5
     escape_extend_steps: int = 5
+    post_escape_grace: int = 8
 
-    # Grace period after escape
-    post_escape_grace: int = 10
-
-    # --- Beacon homing ---
-    homing_hold_steps: int = 5
-    homing_patience: int = 40
-    homing_entry_threshold: float = 8.0
-    homing_min_improvement: float = 0.05
-    homing_action_hold: int = 5
+    # --- Beacon approach ---
+    # Entry: beacon_dist in latent space must be below this to enter approach
+    approach_entry_threshold: float = 5.0
+    # Exit: if beacon_dist rises above this, exit approach
+    approach_exit_threshold: float = 7.0
+    # Patience: max steps without improvement before exiting
+    approach_patience: int = 60
+    approach_min_improvement: float = 0.1
+    # Approach behaviour: walk forward, oscillate yaw slightly
+    approach_speed: float = 0.25
+    approach_yaw_amplitude: float = 0.3   # yaw oscillation amplitude
+    approach_yaw_period: int = 40         # steps per full oscillation
 
     # --- Frontier grid ---
     frontier_cell_size: float = 0.25
@@ -124,15 +104,31 @@ class FrontierGrid:
     def cells_visited(self) -> int:
         return int(self.visited.sum())
 
+    def novelty_score(self, x: float, y: float, radius: int = 2) -> float:
+        """Return fraction of cells in NxN neighbourhood that are unvisited."""
+        ix = int((x - self.world_min[0]) / self.cell_size)
+        iy = int((y - self.world_min[1]) / self.cell_size)
+        total = 0
+        unvisited = 0
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                nx_ = ix + dx
+                ny_ = iy + dy
+                if 0 <= nx_ < self.nx and 0 <= ny_ < self.ny:
+                    total += 1
+                    if not self.visited[nx_, ny_]:
+                        unvisited += 1
+        return unvisited / max(total, 1)
+
 
 # ---------------------------------------------------------------------- #
 # Main planner
 # ---------------------------------------------------------------------- #
 
 class GreedyEnergyPlanner:
-    """Energy-scored explorer with collision memory and beacon homing.
+    """Forward-biased geometric explorer with JEPA beacon detection.
 
-    State machine: ESCAPE -> GRACE -> NAVIGATE <-> BEACON_HOME
+    State machine: ESCAPE -> GRACE -> NAVIGATE <-> APPROACH
     """
 
     def __init__(
@@ -140,7 +136,7 @@ class GreedyEnergyPlanner:
         world_model: nn.Module,
         energy_head: nn.Module,
         config: ExplorerConfig | None = None,
-        action_set: list | None = None,
+        action_set: list | None = None,  # ignored, API compat
         device: torch.device = torch.device("cpu"),
     ):
         self.wm = world_model
@@ -148,44 +144,39 @@ class GreedyEnergyPlanner:
         self.cfg = config if isinstance(config, ExplorerConfig) else ExplorerConfig()
         self.device = device
 
-        primitives = action_set or ACTION_SET
-        self._actions = torch.tensor(primitives, dtype=torch.float32, device=device)
         self._lo = torch.tensor(self.cfg.action_low, device=device)
         self._hi = torch.tensor(self.cfg.action_high, device=device)
 
         # Beacon targets
         self._beacon_targets: Dict[str, torch.Tensor] = {}
+        self._beacon_positions: Dict[str, Tuple[float, float]] = {}
         self._captured_beacons: Set[str] = set()
+
+        # Obstacle layout for geometric probing (set by eval script)
+        self._obstacle_layout = None
+        self._collision_fn: Optional[Callable] = None
 
         # State
         self._mode: str = "navigate"
         self._step_count: int = 0
         self._total_escapes: int = 0
 
-        # Escape state
+        # Escape
         self._escape_remaining: int = 0
         self._escape_reverse_left: int = 0
         self._escape_yaw: float = 0.0
         self._last_escape_sign: float = 1.0
-
-        # Grace state
         self._grace_remaining: int = 0
 
-        # Action commitment
-        self._held_action: Optional[torch.Tensor] = None
-        self._hold_remaining: int = 0
+        # Navigate
+        self._nav_cmd: Optional[torch.Tensor] = None
+        self._nav_hold_remaining: int = 0
 
-        # Collision heading memory: deque of (yaw_at_collision,)
-        self._collision_headings: deque = deque(
-            maxlen=self.cfg.collision_heading_memory,
-        )
-
-        # Beacon homing state
-        self._homing_target_id: Optional[str] = None
-        self._homing_best_dist: float = float("inf")
-        self._homing_stale_steps: int = 0
-        self._homing_held_action: Optional[torch.Tensor] = None
-        self._homing_hold_remaining: int = 0
+        # Approach
+        self._approach_target_id: Optional[str] = None
+        self._approach_best_dist: float = float("inf")
+        self._approach_stale_steps: int = 0
+        self._approach_step: int = 0  # for yaw oscillation
 
         # Frontier grid
         self._frontier = FrontierGrid(
@@ -208,20 +199,19 @@ class GreedyEnergyPlanner:
 
     def reset(self) -> None:
         self._beacon_targets.clear()
+        self._beacon_positions.clear()
         self._captured_beacons.clear()
         self._mode = "navigate"
         self._step_count = 0
         self._total_escapes = 0
         self._escape_remaining = 0
         self._grace_remaining = 0
-        self._held_action = None
-        self._hold_remaining = 0
-        self._collision_headings.clear()
-        self._homing_target_id = None
-        self._homing_best_dist = float("inf")
-        self._homing_stale_steps = 0
-        self._homing_held_action = None
-        self._homing_hold_remaining = 0
+        self._nav_cmd = None
+        self._nav_hold_remaining = 0
+        self._approach_target_id = None
+        self._approach_best_dist = float("inf")
+        self._approach_stale_steps = 0
+        self._approach_step = 0
         self._last_escape_sign = 1.0
         self._prev_action = None
         self._frontier = FrontierGrid(
@@ -234,12 +224,26 @@ class GreedyEnergyPlanner:
     def set_beacon_targets(self, targets: Dict[str, torch.Tensor]) -> None:
         self._beacon_targets = {k: v.to(self.device) for k, v in targets.items()}
 
+    def set_beacon_positions(self, positions: Dict[str, Tuple[float, float]]) -> None:
+        """Store physical XY positions of beacons for line-of-sight checks."""
+        self._beacon_positions = dict(positions)
+
+    def set_obstacle_layout(self, layout, collision_fn) -> None:
+        """Provide obstacle layout and collision function for geometric probing.
+
+        Args:
+            layout: ObstacleLayout instance.
+            collision_fn: callable(robot_pos_xy_tensor, layout, margin) -> bool_tensor
+        """
+        self._obstacle_layout = layout
+        self._collision_fn = collision_fn
+
     def mark_captured(self, identity: str) -> None:
         self._captured_beacons.add(identity)
-        if self._homing_target_id == identity:
-            self._homing_target_id = None
+        if self._approach_target_id == identity:
+            self._approach_target_id = None
             self._mode = "navigate"
-            self._hold_remaining = 0
+            self._nav_hold_remaining = 0
 
     def report_pose(self, xy: np.ndarray, yaw: float = 0.0) -> None:
         self._robot_xy = np.array(xy, dtype=np.float32)
@@ -248,7 +252,6 @@ class GreedyEnergyPlanner:
 
     def report_collision(self, colliding: bool) -> None:
         if colliding and self._mode != "escape" and self._grace_remaining == 0:
-            self._collision_headings.append(self._robot_yaw)
             self._start_escape()
 
     @property
@@ -286,10 +289,9 @@ class GreedyEnergyPlanner:
 
         # Collision -> escape
         if colliding and self._mode != "escape" and self._grace_remaining == 0:
-            self._collision_headings.append(self._robot_yaw)
             self._start_escape()
 
-        # ESCAPE mode
+        # ESCAPE
         if self._mode == "escape":
             cmd = self._escape_step(colliding)
             self._prev_action = cmd
@@ -300,18 +302,15 @@ class GreedyEnergyPlanner:
             self._grace_remaining -= 1
             if self._grace_remaining == 0:
                 self._mode = "navigate"
-                self._hold_remaining = 0
+                self._nav_hold_remaining = 0
 
-        # Prep observation tensors
+        # JEPA beacon detection (encode once per step, lightweight)
         if vis.dim() == 3:
             vis = vis.unsqueeze(0)
         if proprio is not None and proprio.dim() == 1:
             proprio = proprio.unsqueeze(0)
 
         z_proj = self.wm.encode_observation(vis, proprio)
-        z_raw = self.wm.encode_raw(vis, proprio)
-
-        # Beacon proximity check
         beacon_dist, beacon_id = self._nearest_beacon_dist(z_proj)
         cur_energy = float(self.eh(z_proj).item())
 
@@ -322,192 +321,148 @@ class GreedyEnergyPlanner:
             "beacon_dist": beacon_dist if beacon_id else -1.0,
             "beacon_target": beacon_id or "none",
             "frontier_cells": self._frontier.cells_visited,
-            "homing_stale": self._homing_stale_steps,
-            "n_collision_headings": len(self._collision_headings),
+            "approach_stale": self._approach_stale_steps,
         }
 
-        # --- Beacon homing transitions ---
-        if self._mode == "beacon_home":
-            if beacon_id and beacon_id == self._homing_target_id:
-                if beacon_dist < self._homing_best_dist - self.cfg.homing_min_improvement:
-                    self._homing_best_dist = beacon_dist
-                    self._homing_stale_steps = 0
+        # --- Approach transitions ---
+        if self._mode == "approach":
+            if beacon_id and beacon_id == self._approach_target_id:
+                if beacon_dist < self._approach_best_dist - self.cfg.approach_min_improvement:
+                    self._approach_best_dist = beacon_dist
+                    self._approach_stale_steps = 0
                 else:
-                    self._homing_stale_steps += 1
-                if self._homing_stale_steps > self.cfg.homing_patience:
+                    self._approach_stale_steps += 1
+                # Exit conditions: stall, distance grew, or lost line-of-sight
+                if (self._approach_stale_steps > self.cfg.approach_patience
+                        or beacon_dist > self.cfg.approach_exit_threshold
+                        or not self._has_line_of_sight(self._approach_target_id)):
                     self._mode = "navigate"
-                    self._homing_target_id = None
-                    self._hold_remaining = 0
+                    self._approach_target_id = None
+                    self._nav_hold_remaining = 0
             else:
                 self._mode = "navigate"
-                self._homing_target_id = None
-                self._hold_remaining = 0
+                self._approach_target_id = None
+                self._nav_hold_remaining = 0
 
         elif self._mode in ("navigate", "grace"):
-            if beacon_id and beacon_dist < self.cfg.homing_entry_threshold:
-                self._mode = "beacon_home"
-                self._homing_target_id = beacon_id
-                self._homing_best_dist = beacon_dist
-                self._homing_stale_steps = 0
-                self._homing_held_action = None
-                self._homing_hold_remaining = 0
+            if (beacon_id
+                    and beacon_dist < self.cfg.approach_entry_threshold
+                    and self._has_line_of_sight(beacon_id)):
+                self._mode = "approach"
+                self._approach_target_id = beacon_id
+                self._approach_best_dist = beacon_dist
+                self._approach_stale_steps = 0
+                self._approach_step = 0
 
         # --- Execute ---
-        if self._mode == "beacon_home":
-            cmd = self._beacon_homing_step(z_raw, z_proj)
+        if self._mode == "approach":
+            cmd = self._approach_step_fn()
         else:
-            cmd = self._navigate_step(z_raw, z_proj)
+            cmd = self._navigate_step()
 
         self._prev_action = cmd
         return cmd.clamp(self._lo, self._hi)
 
     # ------------------------------------------------------------------ #
-    # Navigate: energy-scored with collision heading memory
+    # Navigate: geometric wall probing + frontier bias
     # ------------------------------------------------------------------ #
 
-    def _navigate_step(
-        self,
-        z_raw: torch.Tensor,
-        z_proj: torch.Tensor,
-    ) -> torch.Tensor:
-        """Score action primitives using energy + collision memory + forward bonus."""
+    def _navigate_step(self) -> torch.Tensor:
+        """Pick the best forward direction using geometric collision probing."""
         # Action commitment
-        if self._hold_remaining > 0 and self._held_action is not None:
-            self._hold_remaining -= 1
-            return self._held_action
+        if self._nav_hold_remaining > 0 and self._nav_cmd is not None:
+            self._nav_hold_remaining -= 1
+            return self._nav_cmd
 
-        N = self._actions.shape[0]
-        H = self.cfg.hold_steps
+        # Probe directions: fan from -90 to +90 degrees relative to heading
+        n_dirs = self.cfg.probe_n_directions
+        best_yaw_offset = 0.0
+        best_score = -1e9
 
-        z_start = z_raw.expand(N, -1)
-        action_seq = self._actions.unsqueeze(1).expand(N, H, 3)
+        angles = np.linspace(-math.pi / 2, math.pi / 2, n_dirs)
+        probe_dist = self.cfg.probe_distance
 
-        # Rollout
-        z_pred_seq = self.wm.plan_rollout(z_start, action_seq)  # (N, H, D)
+        for angle in angles:
+            world_angle = self._robot_yaw + angle
+            probe_x = self._robot_xy[0] + probe_dist * math.cos(world_angle)
+            probe_y = self._robot_xy[1] + probe_dist * math.sin(world_angle)
 
-        # Energy score (low weight — noisy near walls but useful in corridors)
-        energy = self.eh.score_trajectory(z_pred_seq) / float(H)  # (N,)
-        costs = self.cfg.energy_weight * energy
+            # Check if probe point is clear of walls
+            clear = True
+            if self._collision_fn is not None and self._obstacle_layout is not None:
+                probe_pt = torch.tensor([[probe_x, probe_y]], dtype=torch.float32)
+                clear = not bool(self._collision_fn(
+                    probe_pt, self._obstacle_layout, margin=0.10,
+                )[0])
 
-        # Adaptive forward bonus
-        e_spread = float(energy.max() - energy.min())
-        if self.cfg.forward_bonus > 0:
-            adaptive_scale = self.cfg.forward_bonus * (1.0 + e_spread)
-            costs = costs - adaptive_scale * self._actions[:, 0]
+            # Score: clearance (1 or 0) + frontier novelty + forward preference
+            score = 0.0
+            if clear:
+                score += 1.0
+            else:
+                score -= 1.0  # strongly avoid blocked directions
 
-        # Collision heading penalty: penalize actions that move toward
-        # recently-collided headings.  Each action's "world heading" is
-        # robot_yaw + atan2(vy, vx) for the action.  We penalize by
-        # angular proximity to each remembered collision heading, with
-        # exponential decay for older collisions.
-        if self._collision_headings and self.cfg.collision_heading_weight > 0:
-            penalty = torch.zeros(N, device=self.device)
-            n_mem = len(self._collision_headings)
-            for i, col_yaw in enumerate(self._collision_headings):
-                # Newer collisions have higher weight
-                age_weight = self.cfg.collision_heading_decay ** (n_mem - 1 - i)
-                for j in range(N):
-                    vx = float(self._actions[j, 0])
-                    vy = float(self._actions[j, 1])
-                    yaw_rate = float(self._actions[j, 2])
-                    # Predicted heading after this action
-                    if abs(vx) > 0.01 or abs(vy) > 0.01:
-                        action_heading = self._robot_yaw + math.atan2(vy, vx)
-                    else:
-                        # Pure rotation: heading after yaw_rate * dt * hold_steps
-                        action_heading = self._robot_yaw + yaw_rate * 0.04 * H
-                    # Angular distance to collision heading
-                    delta = action_heading - col_yaw
-                    delta = math.atan2(math.sin(delta), math.cos(delta))
-                    # Gaussian-ish penalty: strong when facing collision direction
-                    penalty[j] += age_weight * math.exp(-delta * delta / 0.5)
+            # Frontier novelty at probe point
+            if self.cfg.frontier_weight > 0:
+                novelty = self._frontier.novelty_score(probe_x, probe_y, radius=2)
+                score += self.cfg.frontier_weight * novelty
 
-            costs = costs + self.cfg.collision_heading_weight * penalty
+            # Prefer forward (less turning)
+            score -= 0.3 * abs(angle)
 
-        # Beacon attraction (even in navigate — gentle pull toward beacons)
-        z_terminal = z_pred_seq[:, -1, :]
-        active_targets = {
-            k: v for k, v in self._beacon_targets.items()
-            if k not in self._captured_beacons
-        }
-        beacon_bonus = torch.zeros(N, device=self.device)
-        if active_targets:
-            target_stack = torch.stack(list(active_targets.values()))
-            dists = torch.cdist(z_terminal, target_stack)
-            min_dists = dists.min(dim=1).values
-            cur_dists = torch.cdist(z_proj, target_stack).min(dim=1).values
-            improvement = cur_dists - min_dists
-            beacon_bonus = improvement.squeeze()
-            if beacon_bonus.dim() == 0:
-                beacon_bonus = beacon_bonus.unsqueeze(0)
-        costs = costs - self.cfg.beacon_weight * beacon_bonus
+            if score > best_score:
+                best_score = score
+                best_yaw_offset = angle
 
-        # Select best
-        best_idx = costs.argmin()
-        best_action = self._actions[best_idx].clone()
+        # Convert best direction to velocity command
+        # Map yaw offset to yaw_rate: larger offset = harder turn
+        yaw_rate = best_yaw_offset * 2.5  # scale factor
+        yaw_rate = max(-1.5, min(1.5, yaw_rate))
+
+        # Speed: slower when turning hard
+        speed = self.cfg.navigate_speed * (1.0 - 0.5 * abs(yaw_rate) / 1.5)
+        speed = max(0.10, speed)
+
+        cmd = torch.tensor([speed, 0.0, yaw_rate], device=self.device)
 
         # Diagnostics
         self.diag.update({
-            "cost_min": float(costs.min()),
-            "cost_mean": float(costs.mean()),
-            "energy_mean": float(energy.mean()),
-            "energy_spread": e_spread,
-            "best_vx": float(best_action[0]),
-            "best_yaw": float(best_action[2]),
-            "beacon_bonus_max": float(beacon_bonus.max()) if active_targets else 0.0,
+            "best_vx": float(speed),
+            "best_yaw": float(yaw_rate),
+            "nav_score": float(best_score),
         })
 
         # Commit
-        self._held_action = best_action
-        self._hold_remaining = self.cfg.action_hold_steps - 1
+        self._nav_cmd = cmd
+        self._nav_hold_remaining = self.cfg.navigate_hold_steps - 1
 
-        return best_action
+        return cmd
 
     # ------------------------------------------------------------------ #
-    # Beacon homing
+    # Approach: walk toward beacon in FOV
     # ------------------------------------------------------------------ #
 
-    def _beacon_homing_step(
-        self,
-        z_raw: torch.Tensor,
-        z_proj: torch.Tensor,
-    ) -> torch.Tensor:
-        """Score actions purely by beacon proximity improvement."""
-        if self._homing_hold_remaining > 0 and self._homing_held_action is not None:
-            self._homing_hold_remaining -= 1
-            return self._homing_held_action
+    def _approach_step_fn(self) -> torch.Tensor:
+        """Walk forward with gentle yaw oscillation to approach visible beacon."""
+        self._approach_step += 1
 
-        target_z = self._beacon_targets.get(self._homing_target_id)
-        if target_z is None:
-            self._mode = "navigate"
-            return self._navigate_step(z_raw, z_proj)
+        # Sinusoidal yaw oscillation: helps find the beacon if it's slightly off-center
+        t = self._approach_step
+        period = self.cfg.approach_yaw_period
+        yaw = self.cfg.approach_yaw_amplitude * math.sin(2 * math.pi * t / period)
 
-        N = self._actions.shape[0]
-        H = self.cfg.homing_hold_steps
-
-        z_start = z_raw.expand(N, -1)
-        action_seq = self._actions.unsqueeze(1).expand(N, H, 3)
-        z_pred_seq = self.wm.plan_rollout(z_start, action_seq)
-        z_terminal = z_pred_seq[:, -1, :]
-
-        target_expanded = target_z.unsqueeze(0).expand(N, -1)
-        dists = torch.norm(z_terminal - target_expanded, dim=-1)
-
-        cur_dist = torch.norm(z_proj - target_z.unsqueeze(0), dim=-1)
-
-        best_idx = dists.argmin()
-        best_action = self._actions[best_idx].clone()
+        cmd = torch.tensor(
+            [self.cfg.approach_speed, 0.0, yaw],
+            device=self.device,
+        )
 
         self.diag.update({
-            "homing_cur_dist": float(cur_dist),
-            "homing_pred_best": float(dists[best_idx]),
-            "best_vx": float(best_action[0]),
-            "best_yaw": float(best_action[2]),
+            "best_vx": float(cmd[0]),
+            "best_yaw": float(yaw),
+            "approach_dist": self._approach_best_dist,
         })
 
-        self._homing_held_action = best_action
-        self._homing_hold_remaining = self.cfg.homing_action_hold - 1
-        return best_action
+        return cmd
 
     # ------------------------------------------------------------------ #
     # Beacon proximity
@@ -522,8 +477,42 @@ class GreedyEnergyPlanner:
             return float("inf"), None
         target_stack = torch.stack(list(active.values()))
         dists = torch.cdist(z_proj, target_stack).squeeze(0)
+        if dists.dim() == 0:
+            return float(dists), list(active.keys())[0]
         min_idx = dists.argmin()
         return float(dists[min_idx]), list(active.keys())[int(min_idx)]
+
+    def _has_line_of_sight(self, beacon_id: str) -> bool:
+        """Check if robot has clear line-of-sight to beacon (no wall in between).
+
+        Uses 2D ray-AABB intersection: sample points along the ray from
+        robot to beacon and check if any hits an obstacle.
+        """
+        if beacon_id not in self._beacon_positions:
+            return True  # no position info, assume visible
+        if self._obstacle_layout is None or self._collision_fn is None:
+            return True
+
+        bx, by = self._beacon_positions[beacon_id]
+        rx, ry = float(self._robot_xy[0]), float(self._robot_xy[1])
+        dx, dy = bx - rx, by - ry
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist < 0.05:
+            return True  # on top of beacon
+
+        # Sample points along the ray every 0.08m
+        n_samples = max(2, int(dist / 0.08))
+        sample_pts = []
+        for i in range(1, n_samples):
+            t = i / n_samples
+            sample_pts.append([rx + t * dx, ry + t * dy])
+
+        if not sample_pts:
+            return True
+
+        pts_tensor = torch.tensor(sample_pts, dtype=torch.float32)
+        hits = self._collision_fn(pts_tensor, self._obstacle_layout, margin=0.02)
+        return not bool(hits.any())
 
     # ------------------------------------------------------------------ #
     # Escape
@@ -542,11 +531,9 @@ class GreedyEnergyPlanner:
             self.cfg.escape_yaw_min, self.cfg.escape_yaw_max,
         )
         self._last_escape_sign *= -1.0
-        self._held_action = None
-        self._hold_remaining = 0
-        self._homing_held_action = None
-        self._homing_hold_remaining = 0
-        self._homing_target_id = None
+        self._nav_cmd = None
+        self._nav_hold_remaining = 0
+        self._approach_target_id = None
 
     def _escape_step(self, still_colliding: bool) -> torch.Tensor:
         self._escape_remaining -= 1
