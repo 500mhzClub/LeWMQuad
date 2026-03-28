@@ -783,7 +783,7 @@ def main():
                 over_rgb = render_rgb(cam_over)
                 eye_rgb = render_rgb(cam_eye)
 
-                esc_tag = (" [ESCAPE]" if planner.is_escaping else "")
+                esc_tag = (" [ESCAPE]" if planner.is_escaping else (" [CRUISE]" if planner.is_cruising else ""))
                 status_lines = [
                     f"step: {step}/{args.max_steps}{esc_tag}",
                     f"pos: ({robot_xy[0]:.2f}, {robot_xy[1]:.2f})  yaw: {math.degrees(robot_yaw):.0f}deg",
@@ -806,7 +806,7 @@ def main():
             if step % 100 == 0:
                 fcells = planner.frontier.cells_visited
                 scov = spatial_cov.coverage_frac * 100
-                esc_tag = (" ESCAPE" if planner.is_escaping else "")
+                esc_tag = (" ESCAPE" if planner.is_escaping else (" CRUISE" if planner.is_cruising else ""))
                 d = planner.diag
                 print(f"  step {step:4d} | energy={cur_energy:.3f} | "
                       f"beacons={sum(captured)}/{n_beacons} | col={total_collisions} | "

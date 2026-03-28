@@ -88,8 +88,20 @@ class GreedyConfig:
     # Extra escape steps when collision persists during escape
     escape_extend_steps: int = 5
 
-    # Post-escape grace period (continue in free mode without re-triggering)
-    post_escape_grace: int = 20
+    # Post-escape cruise: after escape completes, hold forward motion
+    # in the new heading for this many steps BEFORE returning to greedy
+    # planning.  Prevents the greedy planner from immediately steering
+    # back toward the wall it just escaped from.
+    post_escape_cruise: int = 40
+    cruise_speed: float = 0.30
+    cruise_yaw_drift: float = 0.05   # slight turn to avoid going perfectly straight
+
+    # Grace period after cruise before collision detection re-arms
+    post_cruise_grace: int = 10
+
+    # Action commitment: re-evaluate only every N steps.
+    # Prevents oscillation and gives the robot time to translate.
+    action_hold_steps: int = 8
 
     # CEM refinement around best primitive (0 = disabled)
     refine_candidates: int = 16
@@ -234,7 +246,15 @@ class GreedyEnergyPlanner:
         self._escape_reverse_left: int = 0
         self._escape_yaw: float = 0.0
         self._last_escape_sign: float = 1.0
+
+        # Post-escape cruise state
+        self._cruise_remaining: int = 0
+        self._cruise_cmd: Optional[torch.Tensor] = None
         self._grace_remaining: int = 0
+
+        # Action commitment: hold last planned action for N steps
+        self._held_action: Optional[torch.Tensor] = None
+        self._hold_remaining: int = 0
 
         # Frontier grid
         self._frontier = FrontierGrid(
@@ -250,6 +270,7 @@ class GreedyEnergyPlanner:
         self._step_count: int = 0
         self._total_escapes: int = 0
         self._is_escaping: bool = False
+        self._is_cruising: bool = False
 
         # Diagnostics (populated every free-mode step)
         self.diag: Dict[str, float] = {}
@@ -263,11 +284,16 @@ class GreedyEnergyPlanner:
         self._beacon_targets.clear()
         self._captured_beacons.clear()
         self._escape_remaining = 0
+        self._cruise_remaining = 0
+        self._cruise_cmd = None
         self._grace_remaining = 0
+        self._held_action = None
+        self._hold_remaining = 0
         self._prev_action = None
         self._step_count = 0
         self._total_escapes = 0
         self._is_escaping = False
+        self._is_cruising = False
         self._last_escape_sign = 1.0
         self._frontier = FrontierGrid(
             self.cfg.frontier_world_min,
@@ -299,6 +325,12 @@ class GreedyEnergyPlanner:
 
     def report_collision(self, colliding: bool) -> None:
         """Signal whether the robot is currently in physical contact."""
+        # If colliding during cruise, abort cruise and re-escape
+        if colliding and self._cruise_remaining > 0:
+            self._cruise_remaining = 0
+            self._is_cruising = False
+            self._start_escape(collision=True)
+            return
         # If we're in free mode and a collision is detected, enter escape
         if colliding and self._escape_remaining == 0 and self._grace_remaining == 0:
             self._start_escape(collision=True)
@@ -306,6 +338,10 @@ class GreedyEnergyPlanner:
     @property
     def is_escaping(self) -> bool:
         return self._is_escaping
+
+    @property
+    def is_cruising(self) -> bool:
+        return self._is_cruising
 
     @property
     def escape_events(self) -> int:
@@ -328,6 +364,12 @@ class GreedyEnergyPlanner:
     ) -> torch.Tensor:
         """Plan one action.
 
+        State machine: ESCAPE → CRUISE → GRACE → FREE
+          - ESCAPE: deterministic reverse+turn (JEPA bypassed)
+          - CRUISE: hold forward in new heading (JEPA bypassed)
+          - GRACE: short cooldown before collision detection re-arms
+          - FREE: greedy energy scoring with action commitment
+
         Args:
             vis: (1, 3, H, W) or (3, H, W) current observation.
             proprio: (1, P) or (P,) proprioception, or None.
@@ -339,23 +381,51 @@ class GreedyEnergyPlanner:
         self._step_count += 1
 
         # --- Contact escape mode ---
-        if colliding and self._escape_remaining == 0 and self._grace_remaining == 0:
+        if colliding and self._escape_remaining == 0 and self._cruise_remaining == 0 and self._grace_remaining == 0:
             self._start_escape(collision=True)
+            self._held_action = None
+            self._hold_remaining = 0
 
         if self._escape_remaining > 0:
             self._is_escaping = True
+            self._is_cruising = False
             cmd = self._escape_step(colliding)
             self._prev_action = cmd
             return cmd
 
-        # --- Grace period after escape ---
+        # --- Post-escape cruise: commit to forward motion ---
+        if self._cruise_remaining > 0:
+            self._is_escaping = False
+            self._is_cruising = True
+            self._cruise_remaining -= 1
+            cmd = self._cruise_cmd
+            if self._cruise_remaining == 0:
+                self._is_cruising = False
+                self._grace_remaining = self.cfg.post_cruise_grace
+            self._prev_action = cmd
+            return cmd.clamp(self._lo, self._hi)
+
+        # --- Grace period after cruise ---
         if self._grace_remaining > 0:
             self._grace_remaining -= 1
             self._is_escaping = False
+            self._is_cruising = False
 
         self._is_escaping = False
+        self._is_cruising = False
 
-        # --- Free mode: greedy 1-step scoring ---
+        # --- Action commitment: hold previous action for N steps ---
+        if self._hold_remaining > 0 and self._held_action is not None:
+            self._hold_remaining -= 1
+            # Break commitment early if collision
+            if colliding:
+                self._held_action = None
+                self._hold_remaining = 0
+            else:
+                self._prev_action = self._held_action
+                return self._held_action
+
+        # --- Free mode: greedy energy scoring ---
         if vis.dim() == 3:
             vis = vis.unsqueeze(0)
         if proprio is not None and proprio.dim() == 1:
@@ -365,6 +435,10 @@ class GreedyEnergyPlanner:
         z_proj = self.wm.encode_observation(vis, proprio)
 
         cmd = self._score_actions(z_raw, z_proj)
+
+        # Commit to this action for N steps
+        self._held_action = cmd.clone()
+        self._hold_remaining = self.cfg.action_hold_steps - 1  # -1 because this step counts
 
         self._prev_action = cmd
         return cmd.clamp(self._lo, self._hi)
@@ -535,6 +609,12 @@ class GreedyEnergyPlanner:
             )
 
         if self._escape_remaining == 0:
-            self._grace_remaining = self.cfg.post_escape_grace
+            # Transition to cruise: hold forward in the new heading
+            self._cruise_remaining = self.cfg.post_escape_cruise
+            drift = self.cfg.cruise_yaw_drift * self._last_escape_sign
+            self._cruise_cmd = torch.tensor(
+                [self.cfg.cruise_speed, 0.0, drift],
+                device=self.device,
+            )
 
         return cmd.clamp(self._lo, self._hi)
