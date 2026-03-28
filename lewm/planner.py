@@ -60,6 +60,11 @@ class CEMConfig:
     turn_steps_max: int = 45
     turn_yaw_min: float = 0.8
     turn_yaw_max: float = 1.4
+    # Fraction of recovery spent reversing before turning
+    reverse_fraction: float = 0.4
+    reverse_speed: float = -0.3
+    # Grace period after recovery before stuck detection resumes
+    post_recovery_grace: int = 15
     # Momentum for warm-start
     warmstart_decay: float = 0.0
     # Optional goal-matching weight
@@ -231,7 +236,9 @@ class CEMPlanner:
         )
         self._is_stuck: bool = False
         self._turn_remaining: int = 0
+        self._turn_total: int = 0       # total steps in current recovery
         self._turn_yaw: float = 0.0
+        self._grace_remaining: int = 0  # post-recovery grace period
 
         # Collision-based recovery (proprioceptive — robot feels bumps)
         self._collision_window: deque = deque(maxlen=10)
@@ -351,31 +358,66 @@ class CEMPlanner:
 
         z_raw = self.wm.encode_raw(vis, proprio)
 
-        # Stuck detection: latent velocity OR collision rate
-        latent_stuck = self._stuck.update(z_raw)
-        collision_stuck = self._collision_stuck()
-        self._is_stuck = latent_stuck or collision_stuck
-        if self._is_stuck and self._turn_remaining == 0:
-            self._turn_remaining = pyrandom.randint(
-                self.cfg.turn_steps_min, self.cfg.turn_steps_max,
-            )
-            self._turn_yaw = pyrandom.choice([-1.0, 1.0]) * pyrandom.uniform(
-                self.cfg.turn_yaw_min, self.cfg.turn_yaw_max,
-            )
-            self._prev_mean = None  # clear warm-start
-            self._collision_window.clear()  # reset so we re-evaluate after turn
-            if collision_stuck:
-                self._stuck.total_stuck_events += 1
-
-        # If in recovery turn, bypass CEM
+        # If in recovery turn, bypass CEM and skip stuck detection entirely
         if self._turn_remaining > 0:
+            self._is_stuck = False  # only True on the detection step
             self._turn_remaining -= 1
             self._ensure_coverage(z_raw.shape[-1])
             self._coverage.mark(z_raw)
-            cmd = torch.tensor(
-                [0.10, 0.0, self._turn_yaw], device=self.device,
-            )
+
+            # First phase: reverse to back away from obstacle
+            reverse_steps = int(self._turn_total * self.cfg.reverse_fraction)
+            steps_done = self._turn_total - self._turn_remaining - 1
+            if steps_done < reverse_steps:
+                cmd = torch.tensor(
+                    [self.cfg.reverse_speed, 0.0, 0.0], device=self.device,
+                )
+            else:
+                # Second phase: forward + turn
+                cmd = torch.tensor(
+                    [0.20, 0.0, self._turn_yaw], device=self.device,
+                )
+
+            if self._turn_remaining == 0:
+                # Recovery just ended — start grace period
+                self._grace_remaining = self.cfg.post_recovery_grace
+                self._collision_window.clear()
+                self._stuck._latents.clear()
+                self._stuck._stuck_count = 0
             return cmd.clamp(self._lo, self._hi)
+
+        # Grace period: skip stuck detection but run CEM normally
+        if self._grace_remaining > 0:
+            self._grace_remaining -= 1
+            self._stuck.update(z_raw)  # feed data but ignore result
+            self._is_stuck = False
+        else:
+            # Stuck detection: latent velocity OR collision rate
+            latent_stuck = self._stuck.update(z_raw)
+            collision_stuck = self._collision_stuck()
+            self._is_stuck = latent_stuck or collision_stuck
+            if self._is_stuck:
+                self._turn_total = pyrandom.randint(
+                    self.cfg.turn_steps_min, self.cfg.turn_steps_max,
+                )
+                self._turn_remaining = self._turn_total
+                self._turn_yaw = pyrandom.choice([-1.0, 1.0]) * pyrandom.uniform(
+                    self.cfg.turn_yaw_min, self.cfg.turn_yaw_max,
+                )
+                self._prev_mean = None  # clear warm-start
+                if collision_stuck:
+                    self._stuck.total_stuck_events += 1
+                # Immediately start recovery on this step (fall through to
+                # the recovery branch on the next call; for this step, just
+                # issue the first reverse command directly)
+                self._is_stuck = True  # signal to eval logger for this one step
+                self._turn_remaining -= 1
+                self._ensure_coverage(z_raw.shape[-1])
+                self._coverage.mark(z_raw)
+                cmd = torch.tensor(
+                    [self.cfg.reverse_speed, 0.0, 0.0], device=self.device,
+                )
+                return cmd.clamp(self._lo, self._hi)
 
         # Normal CEM planning
         z_goal_proj = None
@@ -424,7 +466,9 @@ class CEMPlanner:
         self._prev_mean = None
         self._is_stuck = False
         self._turn_remaining = 0
+        self._turn_total = 0
         self._turn_yaw = 0.0
+        self._grace_remaining = 0
         self._collision_window.clear()
         if self._coverage is not None:
             self._coverage.clear()

@@ -697,7 +697,7 @@ def main():
 
                 cov = planner.coverage
                 cov_cells = cov.cells_visited if cov else 0
-                stuck_tag = " [STUCK]" if planner.is_stuck else ""
+                stuck_tag = " [STUCK]" if planner.is_stuck else (" [TURNING]" if planner.is_turning else "")
                 status_lines = [
                     f"step: {step}/{args.max_steps}{stuck_tag}",
                     f"pos: ({robot_xy[0]:.2f}, {robot_xy[1]:.2f})  yaw: {math.degrees(robot_yaw):.0f}deg",
@@ -721,7 +721,7 @@ def main():
                 cov = planner.coverage
                 lcells = cov.cells_visited if cov else 0
                 scov = spatial_cov.coverage_frac * 100
-                stuck_tag = " STUCK" if planner.is_stuck else ""
+                stuck_tag = " STUCK" if planner.is_stuck else (" TURNING" if planner.is_turning else "")
                 d = planner.diag
                 print(f"  step {step:4d} | energy={cur_energy:.3f} | "
                       f"beacons={sum(captured)}/{n_beacons} | col={total_collisions} | "
