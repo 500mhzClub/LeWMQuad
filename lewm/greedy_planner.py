@@ -1,21 +1,21 @@
-"""Greedy one-step energy planner with contact escape.
+"""Random-walk explorer with JEPA beacon homing.
 
-Scores a small set of discrete action primitives using one-step
-predictions through the world model, avoiding the long-horizon
-autoregressive rollouts that suffer from exposure bias and
-wall-clipping hallucinations.
+The energy head cannot see walls (trained on camera-clipped data), so
+we abandon energy-based navigation entirely for exploration.  Instead:
 
-Two-mode controller:
-  - **Free mode** (no collision): encode current observation, predict
-    one step for each action primitive, score by energy + beacon
-    proximity + frontier bonus, take the argmin.
-  - **Contact mode** (collision detected): bypass JEPA entirely
-    (camera is clipped through the wall), execute a deterministic
-    reverse-then-turn escape sequence.
+  - **WANDER**: random forward-biased walk.  Pick a random action
+    (weighted toward forward), hold for 15-25 steps, repeat.  On
+    collision -> ESCAPE.
+  - **ESCAPE**: deterministic reverse + large turn (~90 deg).  On
+    completion -> GRACE -> WANDER with a new random heading.
+  - **BEACON_HOME**: when the current observation is "close" to a
+    beacon latent (and getting closer), switch to JEPA-guided action
+    selection that scores primitives purely by beacon proximity
+    improvement.  On stall or collision -> back to WANDER.
 
 Typical usage::
 
-    planner = GreedyEnergyPlanner(world_model, energy_head, device=device)
+    planner = RandomExplorerPlanner(world_model, energy_head, device=device)
     planner.set_beacon_targets(beacon_latents)
 
     for obs in environment:
@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import math
 import random as pyrandom
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -40,81 +39,77 @@ import torch.nn as nn
 # Configuration
 # ---------------------------------------------------------------------- #
 
-# Discrete action primitives: (vx, vy, yaw_rate)
-DEFAULT_ACTION_SET: List[Tuple[float, float, float]] = [
+# Discrete action primitives for beacon homing: (vx, vy, yaw_rate)
+HOMING_ACTION_SET: List[Tuple[float, float, float]] = [
     ( 0.35,  0.00,  0.0),    # forward
-    ( 0.25,  0.00,  0.4),    # forward-left
-    ( 0.25,  0.00, -0.4),    # forward-right
-    ( 0.15,  0.00,  0.8),    # sharp left
-    ( 0.15,  0.00, -0.8),    # sharp right
-    ( 0.00,  0.00,  1.2),    # spin left
-    ( 0.00,  0.00, -1.2),    # spin right
-    ( 0.35,  0.15,  0.0),    # forward + strafe left
-    ( 0.35, -0.15,  0.0),    # forward + strafe right
-    (-0.20,  0.00,  0.0),    # reverse
-    ( 0.00,  0.00,  0.0),    # stop
-    ( 0.40,  0.00,  0.0),    # fast forward
+    ( 0.30,  0.00,  0.3),    # forward-left
+    ( 0.30,  0.00, -0.3),    # forward-right
+    ( 0.20,  0.00,  0.6),    # left
+    ( 0.20,  0.00, -0.6),    # right
+    ( 0.10,  0.00,  1.0),    # sharp left
+    ( 0.10,  0.00, -1.0),    # sharp right
+    ( 0.35,  0.12,  0.0),    # forward + strafe left
+    ( 0.35, -0.12,  0.0),    # forward + strafe right
+]
+
+# Random wander actions: forward-biased with occasional turns
+WANDER_ACTION_SET: List[Tuple[float, float, float]] = [
+    # Forward variants (high probability weight)
+    ( 0.35,  0.00,  0.0),    # straight
+    ( 0.35,  0.00,  0.0),    # straight (duplicated for bias)
+    ( 0.35,  0.00,  0.0),    # straight (duplicated for bias)
+    ( 0.30,  0.00,  0.15),   # gentle left
+    ( 0.30,  0.00, -0.15),   # gentle right
+    ( 0.25,  0.00,  0.35),   # moderate left
+    ( 0.25,  0.00, -0.35),   # moderate right
+    # Turn variants (lower probability)
+    ( 0.15,  0.00,  0.7),    # hard left
+    ( 0.15,  0.00, -0.7),    # hard right
 ]
 
 
 @dataclass
-class GreedyConfig:
-    """All hyper-parameters for the greedy energy planner."""
+class ExplorerConfig:
+    """All hyper-parameters for the random-walk explorer."""
 
     # Per-dimension action bounds [vx, vy, yaw_rate]
     action_low: Tuple[float, float, float] = (-0.5, -0.3, -1.5)
     action_high: Tuple[float, float, float] = (0.5, 0.3, 1.5)
 
-    # How many steps to hold each action primitive for scoring.
-    # 1-step predictions produce near-identical latents (~1.5cm displacement)
-    # which the energy head cannot discriminate.  5 steps ≈ 7cm displacement
-    # and stays within the predictor's accurate regime (seq_len=4 + 1).
-    hold_steps: int = 5
+    # --- Wander ---
+    wander_hold_min: int = 15        # min steps to hold each random action
+    wander_hold_max: int = 30        # max steps
 
-    # Scoring weights
-    energy_weight: float = 1.0       # energy head cost
-    beacon_weight: float = 0.5       # beacon proximity reward
-    frontier_weight: float = 0.2     # frontier exploration reward
-    forward_bonus: float = 0.10      # adaptive: scales with energy spread
-
-    # Contact escape parameters
-    escape_reverse_steps: int = 8    # steps spent reversing
-    escape_turn_steps_min: int = 10  # min steps spent turning
-    escape_turn_steps_max: int = 25  # max steps spent turning
+    # --- Escape ---
+    escape_reverse_steps: int = 10   # steps spent reversing
+    escape_turn_steps_min: int = 15  # min turn steps (~90 deg at yaw=1.2)
+    escape_turn_steps_max: int = 30  # max turn steps
     escape_reverse_speed: float = -0.3
-    escape_forward_speed: float = 0.25
-    escape_yaw_min: float = 0.8
-    escape_yaw_max: float = 1.4
-    # Extra escape steps when collision persists during escape
-    escape_extend_steps: int = 5
+    escape_turn_fwd_speed: float = 0.15   # slight forward during turn
+    escape_yaw_min: float = 1.0      # ~57 deg/sec
+    escape_yaw_max: float = 1.5      # ~86 deg/sec
+    escape_extend_steps: int = 5     # extend reverse if still colliding
 
-    # Post-escape cruise: after escape completes, hold forward motion
-    # in the new heading for this many steps BEFORE returning to greedy
-    # planning.  Prevents the greedy planner from immediately steering
-    # back toward the wall it just escaped from.
-    post_escape_cruise: int = 40
-    cruise_speed: float = 0.30
-    cruise_yaw_drift: float = 0.05   # slight turn to avoid going perfectly straight
+    # Grace period after escape before collision detection re-arms
+    post_escape_grace: int = 12
 
-    # Grace period after cruise before collision detection re-arms
-    post_cruise_grace: int = 10
+    # --- Beacon homing ---
+    # Rollout length for scoring beacon homing actions
+    homing_hold_steps: int = 5
+    # How many steps to stay in homing mode without improvement before dropping back
+    homing_patience: int = 30
+    # Beacon proximity threshold to enter homing (L2 distance in projected latent space)
+    # Lower = stricter, only home when very close.  Start generous and tune down.
+    homing_entry_threshold: float = 8.0
+    # Minimum improvement per homing_patience window to stay in homing
+    homing_min_improvement: float = 0.05
+    # Action commitment during homing
+    homing_action_hold: int = 5
 
-    # Action commitment: re-evaluate only every N steps.
-    # Prevents oscillation and gives the robot time to translate.
-    action_hold_steps: int = 8
-
-    # CEM refinement around best primitive (0 = disabled)
-    refine_candidates: int = 16
-    refine_std: float = 0.08
-
-    # Frontier grid
+    # --- Frontier grid ---
     frontier_cell_size: float = 0.25
     frontier_world_min: Tuple[float, float] = (-3.5, -3.5)
     frontier_world_max: Tuple[float, float] = (3.5, 3.5)
-
-    # Momentum: slightly prefer continuing current action direction.
-    # Prevents oscillation (especially post-escape whiplash).
-    momentum: float = 0.3
 
 
 # ---------------------------------------------------------------------- #
@@ -149,90 +144,33 @@ class FrontierGrid:
     def cells_visited(self) -> int:
         return int(self.visited.sum())
 
-    def frontier_score_for_actions(
-        self,
-        robot_xy: np.ndarray,
-        robot_yaw: float,
-        actions: np.ndarray,
-        dt: float = 0.04,
-    ) -> np.ndarray:
-        """Score each action by how close it moves toward unvisited cells.
-
-        Uses a simple kinematic prediction (one step) to estimate where
-        each action would place the robot, then scores by inverse distance
-        to the nearest unvisited cell.
-
-        Args:
-            robot_xy: (2,) current robot XY.
-            robot_yaw: current heading (rad).
-            actions: (N, 3) action primitives [vx, vy, yaw].
-            dt: control timestep.
-
-        Returns:
-            (N,) scores, higher = more frontier-ward.
-        """
-        N = len(actions)
-        scores = np.zeros(N, dtype=np.float32)
-
-        # Find unvisited cells
-        unvisited_ij = np.argwhere(~self.visited)
-        if len(unvisited_ij) == 0:
-            return scores
-
-        # World coordinates of unvisited cell centres
-        unvisited_xy = (
-            self.world_min[np.newaxis, :]
-            + (unvisited_ij + 0.5) * self.cell_size
-        )
-
-        cos_yaw = math.cos(robot_yaw)
-        sin_yaw = math.sin(robot_yaw)
-
-        for i in range(N):
-            vx, vy, _ = float(actions[i, 0]), float(actions[i, 1]), float(actions[i, 2])
-            # Predicted displacement in world frame
-            dx = (vx * cos_yaw - vy * sin_yaw) * dt
-            dy = (vx * sin_yaw + vy * cos_yaw) * dt
-            pred_xy = robot_xy + np.array([dx, dy], dtype=np.float32)
-
-            # Distance from predicted position to nearest unvisited cell
-            dists = np.linalg.norm(unvisited_xy - pred_xy[np.newaxis, :], axis=1)
-            min_dist = dists.min()
-            # Inverse distance: closer to frontier = higher score
-            scores[i] = 1.0 / (1.0 + min_dist)
-
-        return scores
-
 
 # ---------------------------------------------------------------------- #
-# Greedy Energy Planner
+# Random Explorer with Beacon Homing
 # ---------------------------------------------------------------------- #
 
 class GreedyEnergyPlanner:
-    """One-step greedy planner with deterministic contact escape.
+    """Random-walk explorer with JEPA-guided beacon homing.
 
-    Instead of multi-step CEM rollouts, scores discrete action primitives
-    using single-step predictions through the world model.  When the
-    robot is in contact with a wall (and the camera has clipped), JEPA
-    observations are untrustworthy so the planner switches to a hardcoded
-    reverse-and-turn escape policy.
+    State machine: ESCAPE -> GRACE -> WANDER <-> BEACON_HOME
     """
 
     def __init__(
         self,
         world_model: nn.Module,
         energy_head: nn.Module,
-        config: GreedyConfig | None = None,
-        action_set: List[Tuple[float, float, float]] | None = None,
+        config: ExplorerConfig | None = None,
+        action_set: list | None = None,    # ignored, kept for API compat
         device: torch.device = torch.device("cpu"),
     ):
         self.wm = world_model
-        self.eh = energy_head
-        self.cfg = config or GreedyConfig()
+        self.eh = energy_head  # kept for diagnostics only
+        self.cfg = config if isinstance(config, ExplorerConfig) else ExplorerConfig()
         self.device = device
 
-        primitives = action_set or DEFAULT_ACTION_SET
-        self._actions = torch.tensor(primitives, dtype=torch.float32, device=device)
+        self._homing_actions = torch.tensor(
+            HOMING_ACTION_SET, dtype=torch.float32, device=device,
+        )
         self._lo = torch.tensor(self.cfg.action_low, device=device)
         self._hi = torch.tensor(self.cfg.action_high, device=device)
 
@@ -240,21 +178,31 @@ class GreedyEnergyPlanner:
         self._beacon_targets: Dict[str, torch.Tensor] = {}
         self._captured_beacons: Set[str] = set()
 
-        # Contact escape state
+        # State
+        self._mode: str = "wander"  # "wander", "escape", "grace", "beacon_home"
+        self._step_count: int = 0
+        self._total_escapes: int = 0
+
+        # Escape state
         self._escape_remaining: int = 0
-        self._escape_phase: str = "reverse"  # "reverse" or "turn"
+        self._escape_phase: str = "reverse"
         self._escape_reverse_left: int = 0
         self._escape_yaw: float = 0.0
         self._last_escape_sign: float = 1.0
 
-        # Post-escape cruise state
-        self._cruise_remaining: int = 0
-        self._cruise_cmd: Optional[torch.Tensor] = None
+        # Grace state
         self._grace_remaining: int = 0
 
-        # Action commitment: hold last planned action for N steps
-        self._held_action: Optional[torch.Tensor] = None
-        self._hold_remaining: int = 0
+        # Wander state
+        self._wander_cmd: Optional[torch.Tensor] = None
+        self._wander_remaining: int = 0
+
+        # Beacon homing state
+        self._homing_target_id: Optional[str] = None
+        self._homing_best_dist: float = float("inf")
+        self._homing_stale_steps: int = 0
+        self._homing_held_action: Optional[torch.Tensor] = None
+        self._homing_hold_remaining: int = 0
 
         # Frontier grid
         self._frontier = FrontierGrid(
@@ -267,12 +215,8 @@ class GreedyEnergyPlanner:
         self._robot_xy: np.ndarray = np.zeros(2, dtype=np.float32)
         self._robot_yaw: float = 0.0
         self._prev_action: Optional[torch.Tensor] = None
-        self._step_count: int = 0
-        self._total_escapes: int = 0
-        self._is_escaping: bool = False
-        self._is_cruising: bool = False
 
-        # Diagnostics (populated every free-mode step)
+        # Diagnostics
         self.diag: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
@@ -280,21 +224,22 @@ class GreedyEnergyPlanner:
     # ------------------------------------------------------------------ #
 
     def reset(self) -> None:
-        """Reset planner state for a new episode."""
         self._beacon_targets.clear()
         self._captured_beacons.clear()
-        self._escape_remaining = 0
-        self._cruise_remaining = 0
-        self._cruise_cmd = None
-        self._grace_remaining = 0
-        self._held_action = None
-        self._hold_remaining = 0
-        self._prev_action = None
+        self._mode = "wander"
         self._step_count = 0
         self._total_escapes = 0
-        self._is_escaping = False
-        self._is_cruising = False
+        self._escape_remaining = 0
+        self._grace_remaining = 0
+        self._wander_cmd = None
+        self._wander_remaining = 0
+        self._homing_target_id = None
+        self._homing_best_dist = float("inf")
+        self._homing_stale_steps = 0
+        self._homing_held_action = None
+        self._homing_hold_remaining = 0
         self._last_escape_sign = 1.0
+        self._prev_action = None
         self._frontier = FrontierGrid(
             self.cfg.frontier_world_min,
             self.cfg.frontier_world_max,
@@ -303,45 +248,34 @@ class GreedyEnergyPlanner:
         self.diag = {}
 
     def set_beacon_targets(self, targets: Dict[str, torch.Tensor]) -> None:
-        """Register pre-encoded beacon latents as goal targets.
-
-        Args:
-            targets: mapping from beacon identity string to projected
-                     latent tensor (D,).
-        """
         self._beacon_targets = {
             k: v.to(self.device) for k, v in targets.items()
         }
 
     def mark_captured(self, identity: str) -> None:
-        """Mark a beacon as captured so it no longer attracts the robot."""
         self._captured_beacons.add(identity)
+        if self._homing_target_id == identity:
+            self._homing_target_id = None
+            self._mode = "wander"
+            self._wander_remaining = 0  # pick new wander action immediately
 
     def report_pose(self, xy: np.ndarray, yaw: float = 0.0) -> None:
-        """Feed ground-truth pose for frontier scoring."""
         self._robot_xy = np.array(xy, dtype=np.float32)
         self._robot_yaw = yaw
         self._frontier.mark(float(xy[0]), float(xy[1]))
 
     def report_collision(self, colliding: bool) -> None:
-        """Signal whether the robot is currently in physical contact."""
-        # If colliding during cruise, abort cruise and re-escape
-        if colliding and self._cruise_remaining > 0:
-            self._cruise_remaining = 0
-            self._is_cruising = False
-            self._start_escape(collision=True)
-            return
-        # If we're in free mode and a collision is detected, enter escape
-        if colliding and self._escape_remaining == 0 and self._grace_remaining == 0:
-            self._start_escape(collision=True)
+        """Signal collision from physics. Triggers escape if not already escaping."""
+        if colliding and self._mode not in ("escape",) and self._grace_remaining == 0:
+            self._start_escape()
 
     @property
     def is_escaping(self) -> bool:
-        return self._is_escaping
+        return self._mode == "escape"
 
     @property
     def is_cruising(self) -> bool:
-        return self._is_cruising
+        return False  # no cruise mode
 
     @property
     def escape_events(self) -> int:
@@ -350,6 +284,10 @@ class GreedyEnergyPlanner:
     @property
     def frontier(self) -> FrontierGrid:
         return self._frontier
+
+    @property
+    def mode(self) -> str:
+        return self._mode
 
     # ------------------------------------------------------------------ #
     # Step
@@ -364,12 +302,6 @@ class GreedyEnergyPlanner:
     ) -> torch.Tensor:
         """Plan one action.
 
-        State machine: ESCAPE → CRUISE → GRACE → FREE
-          - ESCAPE: deterministic reverse+turn (JEPA bypassed)
-          - CRUISE: hold forward in new heading (JEPA bypassed)
-          - GRACE: short cooldown before collision detection re-arms
-          - FREE: greedy energy scoring with action commitment
-
         Args:
             vis: (1, 3, H, W) or (3, H, W) current observation.
             proprio: (1, P) or (P,) proprioception, or None.
@@ -380,201 +312,196 @@ class GreedyEnergyPlanner:
         """
         self._step_count += 1
 
-        # --- Contact escape mode ---
-        if colliding and self._escape_remaining == 0 and self._cruise_remaining == 0 and self._grace_remaining == 0:
-            self._start_escape(collision=True)
-            self._held_action = None
-            self._hold_remaining = 0
+        # --- Collision -> escape (unless already escaping or in grace) ---
+        if colliding and self._mode != "escape" and self._grace_remaining == 0:
+            self._start_escape()
 
-        if self._escape_remaining > 0:
-            self._is_escaping = True
-            self._is_cruising = False
+        # --- ESCAPE mode ---
+        if self._mode == "escape":
             cmd = self._escape_step(colliding)
             self._prev_action = cmd
             return cmd
 
-        # --- Post-escape cruise: commit to forward motion ---
-        if self._cruise_remaining > 0:
-            self._is_escaping = False
-            self._is_cruising = True
-            self._cruise_remaining -= 1
-            cmd = self._cruise_cmd
-            if self._cruise_remaining == 0:
-                self._is_cruising = False
-                self._grace_remaining = self.cfg.post_cruise_grace
-            self._prev_action = cmd
-            return cmd.clamp(self._lo, self._hi)
-
-        # --- Grace period after cruise ---
+        # --- GRACE period ---
         if self._grace_remaining > 0:
             self._grace_remaining -= 1
-            self._is_escaping = False
-            self._is_cruising = False
+            if self._grace_remaining == 0:
+                self._mode = "wander"
+                self._wander_remaining = 0  # pick fresh action
 
-        self._is_escaping = False
-        self._is_cruising = False
-
-        # --- Action commitment: hold previous action for N steps ---
-        if self._hold_remaining > 0 and self._held_action is not None:
-            self._hold_remaining -= 1
-            # Break commitment early if collision
-            if colliding:
-                self._held_action = None
-                self._hold_remaining = 0
-            else:
-                self._prev_action = self._held_action
-                return self._held_action
-
-        # --- Free mode: greedy energy scoring ---
+        # --- Encode observation (needed for beacon check & homing) ---
         if vis.dim() == 3:
             vis = vis.unsqueeze(0)
         if proprio is not None and proprio.dim() == 1:
             proprio = proprio.unsqueeze(0)
 
-        z_raw = self.wm.encode_raw(vis, proprio)
         z_proj = self.wm.encode_observation(vis, proprio)
+        z_raw = self.wm.encode_raw(vis, proprio)
 
-        cmd = self._score_actions(z_raw, z_proj)
+        # --- Check beacon proximity -> maybe switch to homing ---
+        beacon_dist, beacon_id = self._nearest_beacon_dist(z_proj)
+        cur_energy = float(self.eh(z_proj).item())
 
-        # Commit to this action for N steps
-        self._held_action = cmd.clone()
-        self._hold_remaining = self.cfg.action_hold_steps - 1  # -1 because this step counts
+        # Update diagnostics
+        self.diag = {
+            "mode": self._mode,
+            "energy": cur_energy,
+            "beacon_dist": beacon_dist if beacon_id else -1.0,
+            "beacon_target": beacon_id or "none",
+            "frontier_cells": self._frontier.cells_visited,
+            "wander_remaining": self._wander_remaining,
+            "homing_stale": self._homing_stale_steps,
+        }
+
+        # Decide whether to enter/stay in beacon homing
+        if self._mode == "beacon_home":
+            # Already homing — check if we should continue
+            if beacon_id and beacon_id == self._homing_target_id:
+                if beacon_dist < self._homing_best_dist - self.cfg.homing_min_improvement:
+                    # Making progress
+                    self._homing_best_dist = beacon_dist
+                    self._homing_stale_steps = 0
+                else:
+                    self._homing_stale_steps += 1
+
+                if self._homing_stale_steps > self.cfg.homing_patience:
+                    # Stalled, drop back to wander
+                    self._mode = "wander"
+                    self._wander_remaining = 0
+                    self._homing_target_id = None
+            else:
+                # Target disappeared or was captured
+                self._mode = "wander"
+                self._wander_remaining = 0
+                self._homing_target_id = None
+
+        elif self._mode in ("wander", "grace"):
+            # Check if we should enter homing
+            if beacon_id and beacon_dist < self.cfg.homing_entry_threshold:
+                self._mode = "beacon_home"
+                self._homing_target_id = beacon_id
+                self._homing_best_dist = beacon_dist
+                self._homing_stale_steps = 0
+                self._homing_held_action = None
+                self._homing_hold_remaining = 0
+
+        # --- Execute current mode ---
+        if self._mode == "beacon_home":
+            cmd = self._beacon_homing_step(z_raw, z_proj)
+        else:
+            cmd = self._wander_step()
 
         self._prev_action = cmd
         return cmd.clamp(self._lo, self._hi)
 
     # ------------------------------------------------------------------ #
-    # Free-mode scoring
+    # Wander mode
     # ------------------------------------------------------------------ #
 
-    def _score_actions(
+    def _wander_step(self) -> torch.Tensor:
+        """Pick/hold a random forward-biased action."""
+        if self._wander_remaining <= 0 or self._wander_cmd is None:
+            # Pick a new random action from the wander set
+            idx = pyrandom.randrange(len(WANDER_ACTION_SET))
+            action = WANDER_ACTION_SET[idx]
+            self._wander_cmd = torch.tensor(action, dtype=torch.float32, device=self.device)
+            self._wander_remaining = pyrandom.randint(
+                self.cfg.wander_hold_min, self.cfg.wander_hold_max,
+            )
+
+        self._wander_remaining -= 1
+        return self._wander_cmd
+
+    # ------------------------------------------------------------------ #
+    # Beacon homing mode
+    # ------------------------------------------------------------------ #
+
+    def _beacon_homing_step(
         self,
         z_raw: torch.Tensor,
         z_proj: torch.Tensor,
     ) -> torch.Tensor:
-        """Score action primitives held for K steps and return the best one.
+        """Score homing action primitives by beacon proximity improvement."""
+        # Action commitment
+        if self._homing_hold_remaining > 0 and self._homing_held_action is not None:
+            self._homing_hold_remaining -= 1
+            return self._homing_held_action
 
-        Each primitive is repeated for ``hold_steps`` to produce enough
-        latent displacement for the energy head to discriminate.
-        """
-        N = self._actions.shape[0]
-        H = self.cfg.hold_steps
+        target_z = self._beacon_targets.get(self._homing_target_id)
+        if target_z is None:
+            # Target gone, fall back
+            self._mode = "wander"
+            return self._wander_step()
 
-        # Expand z_raw for batch rollout: (N, D)
+        N = self._homing_actions.shape[0]
+        H = self.cfg.homing_hold_steps
+
         z_start = z_raw.expand(N, -1)
+        action_seq = self._homing_actions.unsqueeze(1).expand(N, H, 3)
 
-        # Repeat each action H times: (N, H, 3)
-        action_seq = self._actions.unsqueeze(1).expand(N, H, 3)
+        # Rollout predictor (returns projected latents)
+        z_pred_seq = self.wm.plan_rollout(z_start, action_seq)  # (N, H, D_proj)
+        z_terminal = z_pred_seq[:, -1, :]  # (N, D_proj)
 
-        # Rollout predictor auto-regressively for H steps
-        z_pred_seq = self.wm.plan_rollout(z_start, action_seq)  # (N, H, D)
+        # Score by distance to target beacon in projected space
+        target_expanded = target_z.unsqueeze(0).expand(N, -1)
+        dists = torch.norm(z_terminal - target_expanded, dim=-1)  # (N,)
 
-        # Score with energy head: mean energy over the K-step trajectory
-        energy = self.eh.score_trajectory(z_pred_seq) / float(H)  # (N,)
-        costs = self.cfg.energy_weight * energy
+        # Current distance for reference
+        cur_dist = torch.norm(z_proj - target_z.unsqueeze(0), dim=-1)  # (1,)
 
-        # Adaptive forward bonus: scale by energy spread so it breaks
-        # ties in flat regions (corridors) without overriding real
-        # energy gradients (approaching a wall head-on).
-        if self.cfg.forward_bonus > 0:
-            e_spread = energy.max() - energy.min()
-            # Bonus magnitude tracks the energy spread: strong enough to
-            # matter when energy is flat, proportionally weaker when the
-            # energy head has a clear opinion.
-            adaptive_scale = self.cfg.forward_bonus * (1.0 + e_spread)
-            costs = costs - adaptive_scale * self._actions[:, 0]
+        # Best action = smallest predicted distance to beacon
+        best_idx = dists.argmin()
+        best_action = self._homing_actions[best_idx].clone()
 
-        # Beacon attraction: use terminal predicted latent
-        z_terminal = z_pred_seq[:, -1, :]  # (N, D)
-        beacon_bonus = torch.zeros(N, device=self.device)
-        active_targets = {
-            k: v for k, v in self._beacon_targets.items()
-            if k not in self._captured_beacons
-        }
-        if active_targets:
-            target_stack = torch.stack(list(active_targets.values()))
-            dists = torch.cdist(z_terminal, target_stack)       # (N, M)
-            min_dists = dists.min(dim=1).values                 # (N,)
-            cur_dists = torch.cdist(z_proj, target_stack).min(dim=1).values  # (1,)
-            improvement = cur_dists - min_dists                 # positive = good
-            beacon_bonus = improvement.squeeze()
-            if beacon_bonus.dim() == 0:
-                beacon_bonus = beacon_bonus.unsqueeze(0)
-
-        costs = costs - self.cfg.beacon_weight * beacon_bonus
-
-        # Frontier exploration bonus (position-based)
-        if self.cfg.frontier_weight > 0:
-            frontier_scores = self._frontier.frontier_score_for_actions(
-                self._robot_xy, self._robot_yaw,
-                self._actions.cpu().numpy(),
-            )
-            frontier_t = torch.from_numpy(frontier_scores).to(self.device)
-            costs = costs - self.cfg.frontier_weight * frontier_t
-
-        # Optional momentum
-        if self.cfg.momentum > 0 and self._prev_action is not None:
-            similarity = (self._actions * self._prev_action.unsqueeze(0)).sum(dim=-1)
-            costs = costs - self.cfg.momentum * similarity
-
-        # Select best primitive
-        best_idx = costs.argmin()
-        best_action = self._actions[best_idx].clone()
-
-        # Optional CEM refinement around the winner
-        if self.cfg.refine_candidates > 0:
-            best_action = self._refine(z_raw, best_action)
-
-        # Populate diagnostics
-        self.diag = {
-            "cost_mean": float(costs.mean()),
-            "cost_min": float(costs.min()),
-            "cost_max": float(costs.max()),
-            "energy_mean": float(energy.mean()),
-            "energy_min": float(energy.min()),
-            "energy_spread": float(e_spread) if self.cfg.forward_bonus > 0 else float(energy.max() - energy.min()),
-            "fwd_scale": float(adaptive_scale) if self.cfg.forward_bonus > 0 else 0.0,
-            "best_energy": float(energy[best_idx]),
-            "beacon_bonus_max": float(beacon_bonus.max()) if active_targets else 0.0,
+        # Update diagnostics
+        self.diag.update({
+            "homing_cur_dist": float(cur_dist),
+            "homing_pred_best": float(dists[best_idx]),
+            "homing_pred_worst": float(dists.max()),
             "best_vx": float(best_action[0]),
             "best_yaw": float(best_action[2]),
-            "frontier_cells": self._frontier.cells_visited,
-        }
+        })
+
+        # Commit
+        self._homing_held_action = best_action
+        self._homing_hold_remaining = self.cfg.homing_action_hold - 1
 
         return best_action
 
-    def _refine(
+    # ------------------------------------------------------------------ #
+    # Beacon proximity check
+    # ------------------------------------------------------------------ #
+
+    def _nearest_beacon_dist(
         self,
-        z_raw: torch.Tensor,
-        center: torch.Tensor,
-    ) -> torch.Tensor:
-        """Small CEM refinement around the best primitive (K-step rollout)."""
-        K = self.cfg.refine_candidates
-        H = self.cfg.hold_steps
-        noise = torch.randn(K, 3, device=self.device) * self.cfg.refine_std
-        candidates = (center.unsqueeze(0) + noise).clamp(self._lo, self._hi)
+        z_proj: torch.Tensor,
+    ) -> Tuple[float, Optional[str]]:
+        """Return (distance, identity) of the nearest uncaptured beacon."""
+        active = {
+            k: v for k, v in self._beacon_targets.items()
+            if k not in self._captured_beacons
+        }
+        if not active:
+            return float("inf"), None
 
-        z_start = z_raw.expand(K, -1)
-        action_seq = candidates.unsqueeze(1).expand(K, H, 3)
-
-        z_pred_seq = self.wm.plan_rollout(z_start, action_seq)  # (K, H, D)
-        energy = self.eh.score_trajectory(z_pred_seq) / float(H)
-        # Adaptive forward bonus (same logic as _score_actions)
-        if self.cfg.forward_bonus > 0:
-            e_spread = energy.max() - energy.min()
-            adaptive_scale = self.cfg.forward_bonus * (1.0 + e_spread)
-            energy = energy - adaptive_scale * candidates[:, 0]
-        best_idx = energy.argmin()
-        return candidates[best_idx]
+        target_stack = torch.stack(list(active.values()))  # (M, D)
+        dists = torch.cdist(z_proj, target_stack).squeeze(0)  # (M,)
+        min_idx = dists.argmin()
+        min_dist = float(dists[min_idx])
+        identity = list(active.keys())[int(min_idx)]
+        return min_dist, identity
 
     # ------------------------------------------------------------------ #
     # Contact escape
     # ------------------------------------------------------------------ #
 
-    def _start_escape(self, collision: bool = True) -> None:
+    def _start_escape(self) -> None:
         """Initiate a reverse-then-turn escape sequence."""
         self._total_escapes += 1
-        reverse_steps = self.cfg.escape_reverse_steps if collision else 0
+        self._mode = "escape"
+
+        reverse_steps = self.cfg.escape_reverse_steps
         turn_steps = pyrandom.randint(
             self.cfg.escape_turn_steps_min, self.cfg.escape_turn_steps_max,
         )
@@ -584,14 +511,19 @@ class GreedyEnergyPlanner:
             self.cfg.escape_yaw_min, self.cfg.escape_yaw_max,
         )
         self._last_escape_sign *= -1.0
-        self._prev_action = None
+
+        # Kill any held actions
+        self._wander_cmd = None
+        self._wander_remaining = 0
+        self._homing_held_action = None
+        self._homing_hold_remaining = 0
+        self._homing_target_id = None
 
     def _escape_step(self, still_colliding: bool) -> torch.Tensor:
         """Execute one step of the escape sequence."""
         self._escape_remaining -= 1
 
         if self._escape_reverse_left > 0:
-            # Phase 1: reverse
             self._escape_reverse_left -= 1
             cmd = torch.tensor(
                 [self.cfg.escape_reverse_speed, 0.0, 0.0],
@@ -602,19 +534,15 @@ class GreedyEnergyPlanner:
                 self._escape_reverse_left += self.cfg.escape_extend_steps
                 self._escape_remaining += self.cfg.escape_extend_steps
         else:
-            # Phase 2: forward + turn
+            # Turn phase: slight forward + yaw
             cmd = torch.tensor(
-                [self.cfg.escape_forward_speed, 0.0, self._escape_yaw],
+                [self.cfg.escape_turn_fwd_speed, 0.0, self._escape_yaw],
                 device=self.device,
             )
 
         if self._escape_remaining == 0:
-            # Transition to cruise: hold forward in the new heading
-            self._cruise_remaining = self.cfg.post_escape_cruise
-            drift = self.cfg.cruise_yaw_drift * self._last_escape_sign
-            self._cruise_cmd = torch.tensor(
-                [self.cfg.cruise_speed, 0.0, drift],
-                device=self.device,
-            )
+            # Transition to grace -> wander
+            self._mode = "grace"
+            self._grace_remaining = self.cfg.post_escape_grace
 
         return cmd.clamp(self._lo, self._hi)

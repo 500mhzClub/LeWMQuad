@@ -42,7 +42,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from lewm.models import LeWorldModel, LatentEnergyHead, ActorCritic
-from lewm.greedy_planner import GreedyEnergyPlanner, GreedyConfig
+from lewm.greedy_planner import GreedyEnergyPlanner, ExplorerConfig
 from lewm.checkpoint_utils import clean_state_dict, load_ppo_checkpoint
 from lewm.math_utils import forward_up_from_quat, world_to_body_vec
 from lewm.genesis_utils import init_genesis_once, to_numpy
@@ -101,20 +101,16 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no_video", action="store_true")
     p.add_argument("--out", type=str, default="eval_results/greedy_eval.mp4")
-    # Greedy planner config
-    p.add_argument("--hold_steps", type=int, default=5,
-                   help="Steps to hold each action primitive for scoring")
-    p.add_argument("--energy_weight", type=float, default=1.0)
-    p.add_argument("--beacon_weight", type=float, default=0.5)
-    p.add_argument("--frontier_weight", type=float, default=0.2)
-    p.add_argument("--forward_bonus", type=float, default=0.10,
-                   help="Adaptive forward bonus (scales with energy spread)")
-    p.add_argument("--momentum", type=float, default=0.3,
-                   help="Momentum to continue current action direction")
-    p.add_argument("--refine_candidates", type=int, default=16)
-    p.add_argument("--escape_reverse_steps", type=int, default=8)
-    p.add_argument("--escape_turn_steps_min", type=int, default=10)
-    p.add_argument("--escape_turn_steps_max", type=int, default=25)
+    # Explorer planner config
+    p.add_argument("--wander_hold_min", type=int, default=15)
+    p.add_argument("--wander_hold_max", type=int, default=30)
+    p.add_argument("--escape_reverse_steps", type=int, default=10)
+    p.add_argument("--escape_turn_steps_min", type=int, default=15)
+    p.add_argument("--escape_turn_steps_max", type=int, default=30)
+    p.add_argument("--homing_entry_threshold", type=float, default=8.0,
+                   help="L2 distance in latent space to enter beacon homing")
+    p.add_argument("--homing_patience", type=int, default=30)
+    p.add_argument("--homing_hold_steps", type=int, default=5)
     # Model config
     p.add_argument("--latent_dim", type=int, default=192)
     p.add_argument("--image_size", type=int, default=224)
@@ -553,20 +549,18 @@ def main():
     print(f"  World model: {args.lewm_ckpt}")
     print(f"  Energy head: {args.energy_ckpt}")
 
-    greedy_config = GreedyConfig(
-        hold_steps=args.hold_steps,
-        energy_weight=args.energy_weight,
-        beacon_weight=args.beacon_weight,
-        frontier_weight=args.frontier_weight,
-        forward_bonus=args.forward_bonus,
-        momentum=args.momentum,
-        refine_candidates=args.refine_candidates,
+    explorer_config = ExplorerConfig(
+        wander_hold_min=args.wander_hold_min,
+        wander_hold_max=args.wander_hold_max,
         escape_reverse_steps=args.escape_reverse_steps,
         escape_turn_steps_min=args.escape_turn_steps_min,
         escape_turn_steps_max=args.escape_turn_steps_max,
+        homing_entry_threshold=args.homing_entry_threshold,
+        homing_patience=args.homing_patience,
+        homing_hold_steps=args.homing_hold_steps,
     )
     planner = GreedyEnergyPlanner(
-        world_model, energy_head, config=greedy_config, device=device,
+        world_model, energy_head, config=explorer_config, device=device,
     )
 
     # Init simulator
@@ -783,9 +777,9 @@ def main():
                 over_rgb = render_rgb(cam_over)
                 eye_rgb = render_rgb(cam_eye)
 
-                esc_tag = (" [ESCAPE]" if planner.is_escaping else (" [CRUISE]" if planner.is_cruising else ""))
+                mode_tag = f" [{planner.mode.upper()}]"
                 status_lines = [
-                    f"step: {step}/{args.max_steps}{esc_tag}",
+                    f"step: {step}/{args.max_steps}{mode_tag}",
                     f"pos: ({robot_xy[0]:.2f}, {robot_xy[1]:.2f})  yaw: {math.degrees(robot_yaw):.0f}deg",
                     f"cmd: ({float(cmd[0]):.2f}, {float(cmd[1]):.2f}, {float(cmd[2]):.2f})",
                     f"collisions: {total_collisions}  escapes: {planner.escape_events}",
@@ -806,18 +800,18 @@ def main():
             if step % 100 == 0:
                 fcells = planner.frontier.cells_visited
                 scov = spatial_cov.coverage_frac * 100
-                esc_tag = (" ESCAPE" if planner.is_escaping else (" CRUISE" if planner.is_cruising else ""))
                 d = planner.diag
-                print(f"  step {step:4d} | energy={cur_energy:.3f} | "
+                mode_str = planner.mode.upper()
+                print(f"  step {step:4d} | {mode_str:11s} | energy={cur_energy:.3f} | "
                       f"beacons={sum(captured)}/{n_beacons} | col={total_collisions} | "
                       f"frontier={fcells} | coverage={scov:.1f}% | "
-                      f"escapes={planner.escape_events}{esc_tag}")
+                      f"escapes={planner.escape_events}")
                 if d:
-                    print(f"    Greedy: cost={d.get('cost_min',0):.3f}/{d.get('cost_mean',0):.3f} "
-                          f"energy={d.get('energy_min',0):.3f}/{d.get('energy_mean',0):.3f} "
-                          f"e_spread={d.get('energy_spread',0):.3f} fwd_s={d.get('fwd_scale',0):.3f} "
-                          f"best_vx={d.get('best_vx',0):.2f} yaw={d.get('best_yaw',0):.2f} "
-                          f"beacon={d.get('beacon_bonus_max',0):.3f}")
+                    beacon_info = f"bcn_dist={d.get('beacon_dist',-1):.2f} target={d.get('beacon_target','none')}"
+                    if planner.mode == "beacon_home":
+                        beacon_info += (f" homing_best={d.get('homing_pred_best',0):.2f}"
+                                        f" stale={d.get('homing_stale',0)}")
+                    print(f"    {beacon_info}  wander_rem={d.get('wander_remaining',0)}")
 
             # All beacons found
             if all(captured):
