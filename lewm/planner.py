@@ -233,6 +233,10 @@ class CEMPlanner:
         self._turn_remaining: int = 0
         self._turn_yaw: float = 0.0
 
+        # Collision-based recovery (proprioceptive — robot feels bumps)
+        self._collision_window: deque = deque(maxlen=10)
+        self._collision_threshold: int = 4  # 4+ collisions in 10 steps = stuck in wall
+
         # Diagnostics from last CEM iteration
         self.diag: dict = {}
 
@@ -347,9 +351,11 @@ class CEMPlanner:
 
         z_raw = self.wm.encode_raw(vis, proprio)
 
-        # Stuck detection
-        self._is_stuck = self._stuck.update(z_raw)
-        if self._is_stuck:
+        # Stuck detection: latent velocity OR collision rate
+        latent_stuck = self._stuck.update(z_raw)
+        collision_stuck = self._collision_stuck()
+        self._is_stuck = latent_stuck or collision_stuck
+        if self._is_stuck and self._turn_remaining == 0:
             self._turn_remaining = pyrandom.randint(
                 self.cfg.turn_steps_min, self.cfg.turn_steps_max,
             )
@@ -357,6 +363,9 @@ class CEMPlanner:
                 self.cfg.turn_yaw_min, self.cfg.turn_yaw_max,
             )
             self._prev_mean = None  # clear warm-start
+            self._collision_window.clear()  # reset so we re-evaluate after turn
+            if collision_stuck:
+                self._stuck.total_stuck_events += 1
 
         # If in recovery turn, bypass CEM
         if self._turn_remaining > 0:
@@ -384,6 +393,16 @@ class CEMPlanner:
     # Properties
     # ------------------------------------------------------------------ #
 
+    def report_collision(self, colliding: bool):
+        """Feed collision signal from the sim (proprioceptive feedback)."""
+        self._collision_window.append(colliding)
+
+    def _collision_stuck(self) -> bool:
+        """True if the robot is colliding too frequently (stuck in wall)."""
+        if len(self._collision_window) < self._collision_window.maxlen:
+            return False
+        return sum(self._collision_window) >= self._collision_threshold
+
     @property
     def coverage(self) -> Optional[LatentCoverageGrid]:
         return self._coverage
@@ -406,6 +425,7 @@ class CEMPlanner:
         self._is_stuck = False
         self._turn_remaining = 0
         self._turn_yaw = 0.0
+        self._collision_window.clear()
         if self._coverage is not None:
             self._coverage.clear()
         self._stuck.reset()

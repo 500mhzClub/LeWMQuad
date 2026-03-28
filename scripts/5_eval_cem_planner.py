@@ -71,7 +71,7 @@ CAM_LOOKAT_DIST = 1.0
 SIM_DECIMATION = 4
 KP, KV = 5.0, 0.5
 ACTION_SCALE = 0.30
-COLLISION_MARGIN = 0.15
+COLLISION_MARGIN = 0.22
 MIN_Z = 0.05
 BEACON_CAPTURE_DIST = 0.35
 
@@ -660,12 +660,14 @@ def main():
             for _ in range(SIM_DECIMATION):
                 scene.step()
 
-            # Collision check
+            # Collision check — also feed to planner as proprioceptive signal
             pos_after = robot.get_pos()
             colliding = detect_collisions(
                 pos_after[:, :2], obstacle_layout, margin=COLLISION_MARGIN,
             )
-            if colliding[0]:
+            is_colliding = bool(colliding[0])
+            planner.report_collision(is_colliding)
+            if is_colliding:
                 total_collisions += 1
 
             # Beacon capture
