@@ -133,8 +133,9 @@ def load_world_model(ckpt_path, args, device):
 
 def load_energy_head(ckpt_path, args, device):
     ckpt = torch.load(ckpt_path, map_location=device)
+    sd = {k.replace("_orig_mod.", ""): v for k, v in ckpt["head_state_dict"].items()}
     head = LatentEnergyHead(latent_dim=args.latent_dim)
-    head.load_state_dict(ckpt["head_state_dict"])
+    head.load_state_dict(sd)
     head = head.to(device).eval()
     for p in head.parameters():
         p.requires_grad_(False)
