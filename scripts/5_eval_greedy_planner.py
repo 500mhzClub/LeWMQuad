@@ -77,7 +77,7 @@ CAM_LOOKAT_DIST = 1.0
 SIM_DECIMATION = 4
 KP, KV = 5.0, 0.5
 ACTION_SCALE = 0.30
-COLLISION_MARGIN = 0.22
+COLLISION_MARGIN = 0.12
 MIN_Z = 0.05
 BEACON_CAPTURE_DIST = 0.35
 
@@ -108,9 +108,9 @@ def parse_args():
     p.add_argument("--beacon_weight", type=float, default=0.5)
     p.add_argument("--collision_heading_weight", type=float, default=0.4)
     p.add_argument("--action_hold_steps", type=int, default=5)
-    p.add_argument("--escape_reverse_steps", type=int, default=8)
-    p.add_argument("--escape_turn_steps_min", type=int, default=12)
-    p.add_argument("--escape_turn_steps_max", type=int, default=25)
+    p.add_argument("--escape_reverse_steps", type=int, default=6)
+    p.add_argument("--escape_turn_steps_min", type=int, default=8)
+    p.add_argument("--escape_turn_steps_max", type=int, default=18)
     p.add_argument("--homing_entry_threshold", type=float, default=8.0)
     p.add_argument("--homing_patience", type=int, default=40)
     # Model config

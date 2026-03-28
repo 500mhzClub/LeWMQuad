@@ -72,9 +72,9 @@ class ExplorerConfig:
     action_hold_steps: int = 5
 
     # --- Escape ---
-    escape_reverse_steps: int = 8
-    escape_turn_steps_min: int = 12
-    escape_turn_steps_max: int = 25
+    escape_reverse_steps: int = 6
+    escape_turn_steps_min: int = 8
+    escape_turn_steps_max: int = 18
     escape_reverse_speed: float = -0.3
     escape_turn_fwd_speed: float = 0.15
     escape_yaw_min: float = 1.0
