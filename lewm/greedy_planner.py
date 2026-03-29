@@ -512,36 +512,70 @@ class GreedyEnergyPlanner:
         return float(dists[min_idx]), list(active.keys())[int(min_idx)]
 
     def _has_line_of_sight(self, beacon_id: str) -> bool:
-        """Check if robot has clear line-of-sight to beacon (no wall in between).
+        """Check if robot has clear line-of-sight to beacon (no wall between).
 
-        Uses 2D ray-AABB intersection: sample points along the ray from
-        robot to beacon and check if any hits an obstacle.
+        Uses analytical 2D ray-AABB slab intersection for each obstacle.
+        Unlike point sampling, this cannot miss thin walls.
         """
         if beacon_id not in self._beacon_positions:
-            return True  # no position info, assume visible
-        if self._obstacle_layout is None or self._collision_fn is None:
+            return True
+        if self._obstacle_layout is None:
             return True
 
         bx, by = self._beacon_positions[beacon_id]
         rx, ry = float(self._robot_xy[0]), float(self._robot_xy[1])
         dx, dy = bx - rx, by - ry
-        dist = math.sqrt(dx * dx + dy * dy)
-        if dist < 0.05:
-            return True  # on top of beacon
-
-        # Sample points along the ray every 0.08m
-        n_samples = max(2, int(dist / 0.08))
-        sample_pts = []
-        for i in range(1, n_samples):
-            t = i / n_samples
-            sample_pts.append([rx + t * dx, ry + t * dy])
-
-        if not sample_pts:
+        ray_len = math.sqrt(dx * dx + dy * dy)
+        if ray_len < 0.05:
             return True
 
-        pts_tensor = torch.tensor(sample_pts, dtype=torch.float32)
-        hits = self._collision_fn(pts_tensor, self._obstacle_layout, margin=0.02)
-        return not bool(hits.any())
+        for obs in self._obstacle_layout.obstacles:
+            cx, cy = obs.pos[0], obs.pos[1]
+            hx, hy = obs.size[0] / 2.0, obs.size[1] / 2.0
+            # AABB bounds
+            x_min, x_max = cx - hx, cx + hx
+            y_min, y_max = cy - hy, cy + hy
+
+            # Ray-AABB slab test (2D)
+            # Ray: P(t) = (rx, ry) + t * (dx, dy), t in [0, 1]
+            t_near = 0.0
+            t_far = 1.0
+
+            # X slab
+            if abs(dx) < 1e-9:
+                # Ray parallel to Y axis
+                if rx < x_min or rx > x_max:
+                    continue  # no intersection
+            else:
+                t1 = (x_min - rx) / dx
+                t2 = (x_max - rx) / dx
+                if t1 > t2:
+                    t1, t2 = t2, t1
+                t_near = max(t_near, t1)
+                t_far = min(t_far, t2)
+                if t_near > t_far:
+                    continue
+
+            # Y slab
+            if abs(dy) < 1e-9:
+                if ry < y_min or ry > y_max:
+                    continue
+            else:
+                t1 = (y_min - ry) / dy
+                t2 = (y_max - ry) / dy
+                if t1 > t2:
+                    t1, t2 = t2, t1
+                t_near = max(t_near, t1)
+                t_far = min(t_far, t2)
+                if t_near > t_far:
+                    continue
+
+            # Ray intersects this obstacle AABB in [t_near, t_far] ⊂ [0, 1]
+            # Skip intersection if it's only at the very end (beacon is ON a wall)
+            if t_near < 0.95:
+                return False
+
+        return True
 
     # ------------------------------------------------------------------ #
     # Escape
