@@ -761,13 +761,16 @@ def main():
                     print(f"  [ESCAPE] step {step} — escape #{cur_escapes}")
             planner._prev_logged_escapes = cur_escapes
 
-            # Beacon capture
+            # Beacon capture — requires proximity AND line-of-sight
             if n_beacons > 0:
                 dists = beacon_distances(robot_xy, beacon_layout)
                 for bi in range(n_beacons):
                     if not captured[bi] and dists[bi] < BEACON_CAPTURE_DIST:
-                        captured[bi] = True
                         b = beacon_layout.beacons[bi]
+                        # LOS check: ensure no wall between robot and beacon
+                        if not planner._has_line_of_sight(b.identity):
+                            continue
+                        captured[bi] = True
                         planner.mark_captured(b.identity)
                         n_found = sum(captured)
                         print(f"  [CAPTURE] {b.identity} beacon at step {step} "
